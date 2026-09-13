@@ -39,6 +39,80 @@ pub fn worker_script() -> Result<PathBuf> {
     Ok(p)
 }
 
+/// 定位 node 可执行文件。
+///
+/// 关键：从 Finder / 启动台启动 GUI 时**不继承 shell 的 PATH**（不会 source .zshrc），
+/// 只查 PATH 会报 `No such file or directory (os error 2)`，所以按顺序兜底：
+/// 1. 环境变量 `SUB2OP_NODE`（桌面端设置 / 容器注入）；
+/// 2. PATH 里的 `node`（终端 / CLI 场景）；
+/// 3. 常见固定位置 + 托管版本目录（nvm / WorkBuddy 托管 / fnm，取版本号最新的）。
+pub fn node_bin() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("SUB2OP_NODE") {
+        let p = p.trim();
+        if !p.is_empty() && Path::new(p).exists() {
+            return Ok(PathBuf::from(p));
+        }
+    }
+
+    if let Ok(out) = Command::new("which").arg("node").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() && Path::new(&s).exists() {
+                return Ok(PathBuf::from(s));
+            }
+        }
+    }
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/bin/node"),
+        PathBuf::from("/usr/local/bin/node"),
+    ];
+    for base in [
+        format!("{home}/.nvm/versions/node"),
+        format!("{home}/.workbuddy/binaries/node/versions"),
+        format!("{home}/Library/Application Support/fnm/node-versions"),
+    ] {
+        if let Some(bin) = latest_managed_node(Path::new(&base)) {
+            candidates.push(bin);
+        }
+    }
+
+    if let Some(b) = candidates.iter().find(|p| p.exists()) {
+        return Ok(b.clone());
+    }
+    anyhow::bail!(
+        "找不到 Node.js。已尝试：PATH、/opt/homebrew/bin、/usr/local/bin、\
+         ~/.nvm/versions/node/*、~/.workbuddy/binaries/node/versions/*、fnm。\
+         可设置环境变量 SUB2OP_NODE=<node 路径> 指定。"
+    )
+}
+
+/// 在托管版本目录（nvm/fnm/WorkBuddy）里挑版本号最新的 node。
+/// 兼容两种布局：`<版本>/bin/node` 与 fnm 的 `<版本>/installation/bin/node`。
+fn latest_managed_node(base: &Path) -> Option<PathBuf> {
+    let mut best: Option<(String, PathBuf)> = None;
+    for entry in std::fs::read_dir(base).ok()?.flatten() {
+        let dir = entry.path();
+        for rel in ["bin/node", "installation/bin/node"] {
+            let bin = dir.join(rel);
+            if bin.exists() {
+                let key = entry.file_name().to_string_lossy().to_string();
+                if best.as_ref().map_or(true, |(k, _)| key > *k) {
+                    best = Some((key, bin));
+                }
+                break;
+            }
+        }
+    }
+    best.map(|(_, b)| b)
+}
+
+/// 用定位到的 node 构造命令。
+fn node_command() -> Result<Command> {
+    Ok(Command::new(node_bin()?))
+}
+
 /// 追加浏览器引擎参数。`None` 时不下发，worker 用默认（内置 Chromium）。
 fn append_engine(cmd: &mut Command, engine: Option<&str>) {
     if let Some(e) = engine {
@@ -61,7 +135,7 @@ fn spawn(mut cmd: Command) -> Result<()> {
 /// 无头打开 URL、截图、打印页面结构（实际由 node worker 执行）。
 pub fn open_and_shoot(url: &str, out: &Path, engine: Option<&str>) -> Result<()> {
     let worker = worker_script()?;
-    let mut cmd = Command::new("node");
+    let mut cmd = node_command()?;
     cmd.arg(&worker).arg("open").arg(url).arg("--out").arg(out);
     append_engine(&mut cmd, engine);
     spawn(cmd)
@@ -71,7 +145,7 @@ pub fn open_and_shoot(url: &str, out: &Path, engine: Option<&str>) -> Result<()>
 /// `cdk` 为 None 时仅做状态检测（不填表、不点击），用于核对门页结构。
 pub fn gate(url: &str, cdk: Option<&str>, out_dir: &Path, engine: Option<&str>) -> Result<()> {
     let worker = worker_script()?;
-    let mut cmd = Command::new("node");
+    let mut cmd = node_command()?;
     cmd.arg(&worker).arg("gate").arg(url).arg("--out-dir").arg(out_dir);
     if let Some(c) = cdk {
         cmd.arg("--cdk").arg(c);
@@ -97,7 +171,7 @@ pub fn fetch(
         anyhow::bail!("邮箱清单文件不存在：{}", emails_file.display());
     }
 
-    let mut cmd = Command::new("node");
+    let mut cmd = node_command()?;
     cmd.arg(&worker)
         .arg("fetch")
         .arg(url)
@@ -134,7 +208,7 @@ pub fn fetch_stream(
         anyhow::bail!("邮箱列表为空，无法执行获取流程");
     }
 
-    let mut cmd = Command::new("node");
+    let mut cmd = node_command()?;
     cmd.arg(&worker)
         .arg("fetch")
         .arg(url)
