@@ -226,8 +226,10 @@ async fn eval_string(page: &chromiumoxide::Page, expr: &str) -> String {
 fn js_visible(sel: &str) -> String {
     format!(
         "(() => {{ const el = document.querySelector({s}); if (!el) return false; \
+         if (el.hasAttribute('hidden')) return false; \
          const r = el.getBoundingClientRect(); \
-         return !!(r.width || r.height) && getComputedStyle(el).visibility !== 'hidden'; }})()",
+         const style = getComputedStyle(el); \
+         return !!(r.width || r.height) && style.display !== 'none' && style.visibility !== 'hidden'; }})()",
         s = json!(sel)
     )
 }
@@ -642,29 +644,58 @@ async fn fetch_native(
         let emails_val = js_input_value(&page, "#emails").await;
         let dl = js_enabled(&page, "#dlAll").await;
         let cp = js_enabled(&page, "#copyAll").await;
+        let copy_visible = visible(&page, "#copyAll").await;
         let elapsed = started.elapsed().as_secs();
+
+        // 完成判定：必须同时满足
+        // 1) #stat 文案里「共 N 个」的 N > 0（批次确实在跑）
+        // 2) #stat 文案里「进行中 Z」的 Z == 0（没有还在跑的子任务）
+        // 3) #copyAll 按钮可见（去掉 hidden，而不是 disabled；一开始按钮 hidden，完成后才显示）
+        // 注意：stat 文案固定为「共 N 个 · 成功 X · 失败 Y · 进行中 Z」，「成功」二字永远存在——
+        // 绝不能用关键词 contains 判定（第一次轮询「进行中 1」也会命中「成功」，之前就栽在这）。
+        // 也不能只看 enabled：按钮由 hidden 控制，初始就 enabled。
+        let num_after = |key: &str| -> Option<u64> {
+            let idx = stat.find(key)?;
+            let rest = stat[idx + key.len()..].trim_start();
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse().ok()
+        };
+        let total = num_after("共");
+        let ok_n = num_after("成功");
+        let err_n = num_after("失败");
+        let live = num_after("进行中");
+
         let snap = json!({
             "t": format!("{}s", elapsed),
             "stat": stat.chars().take(200).collect::<String>(),
             "err": err_tx.chars().take(200).collect::<String>(),
             "emailsLen": emails_val.chars().count(),
+            "total": total,
+            "ok": ok_n,
+            "fail": err_n,
+            "live": live,
             "dlAll": dl,
             "copyAll": cp,
+            "copyAllVisible": copy_visible,
         });
         poll_log.push(snap.clone());
         log(format!(
-            "[poll {}s] stat={} dlAll={} copyAll={}",
+            "[poll {}s] stat={} copyAllVisible={} live={:?}",
             elapsed,
             stat.chars().take(120).collect::<String>(),
-            dl,
-            cp
+            copy_visible,
+            live
         ));
 
-        let stat_l = stat.to_lowercase();
-        let words = ["完成", "成功", "结束", "已获取", "done", "finish"];
-        if words.iter().any(|w| stat_l.contains(w)) || (dl && cp) {
+        if total.unwrap_or(0) > 0 && live == Some(0) && copy_visible {
             done = true;
             final_state = snap;
+            log(format!(
+                "批次结束：成功 {} / 失败 {} / 共 {}",
+                ok_n.unwrap_or(0),
+                err_n.unwrap_or(0),
+                total.unwrap_or(0)
+            ));
             break;
         }
         if !stat.is_empty() && stat == last_stat {
@@ -673,10 +704,12 @@ async fn fetch_native(
             stable = 0;
         }
         last_stat = stat;
-        if stable >= 3 {
+        // 兜底：stat 连续 3 次不变，且批次确实在跑（total>0）且「复制全部」按钮已显示。
+        // 这里不再要求 live 必须解析不到，避免模板没变、主条件已满足时由于抖动错过。
+        if stable >= 3 && total.unwrap_or(0) > 0 && copy_visible {
             done = true;
             final_state = snap;
-            log("#stat 连续 3 次不变，视为完成/停滞".to_string());
+            log("#stat 连续 3 次不变且复制全部按钮已显示，视为完成".to_string());
             break;
         }
     }
