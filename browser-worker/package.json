@@ -1,0 +1,12 @@
+{
+  "name": "sub2op-browser-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "无头浏览器 worker（与 xiic-crm 同构：playwright-core 驱动 Chromium）",
+  "dependencies": {
+    "playwright-core": "^1.60.0"
+  },
+  "scripts": {
+    "install:browser": "playwright-core install chromium"
+  }
+}

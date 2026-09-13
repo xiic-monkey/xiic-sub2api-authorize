@@ -1,0 +1,20 @@
+# sub2api 实例地址（不含 /api/v1 后缀）
+base_url = "https://your-sub2api.example.com"
+
+# 管理员邮箱 / 密码
+email = "admin@sub2api.local"
+password = "change-me"
+
+# 如果后台开启了 2FA(TOTP)，填 base32 密钥；没开就删掉这行
+# totp_secret = "JBSWY3DPEHPK3PXP"
+
+# 自签证书且要跳过校验时设 false；默认 true（校验证书）
+verify_tls = true
+
+# ---- 一键重授权（web 页面 / 服务器部署用） ----
+# 接码门页地址
+gate_url = "https://401.kyon888.xyz"
+# CPA/Sub2API 转换页：把接码结果转成 sub2api 凭证（含 refresh_token）
+cpa_url = "https://zh.kyon888.xyz/CPAandSub2API/"
+# 浏览器轮询最长等待秒数
+max_seconds = 150

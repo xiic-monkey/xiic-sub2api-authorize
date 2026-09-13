@@ -1,0 +1,11 @@
+/target
+config.toml
+credentials.db
+*.db
+
+# 本地记忆（WorkBuddy），不进 git
+.workbuddy/
+
+# playwright 浏览器（内置，项目内，不进 git）
+.pw-browsers/
+browser-worker/node_modules/

@@ -1,0 +1,28 @@
+[package]
+name = "sub2api-operator"
+version = "0.1.0"
+edition = "2021"
+
+# 同一个 crate 两种产物：
+# - lib  `sub2api_operator`：被 Tauri 桌面端 path 依赖，复用全部核心逻辑
+# - bin  `sub2api-operator`：命令行 / 服务器运维入口
+[lib]
+name = "sub2api_operator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sub2api-operator"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+totp-rs = "5"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = "0.4"

@@ -1,0 +1,7 @@
+/target
+/.git
+config.toml
+credentials.db
+.pw-browsers
+browser-worker/node_modules
+*.png
