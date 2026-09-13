@@ -268,7 +268,11 @@ pub fn build_plan(
     })
 }
 
-/// 核心：执行写回（逐项 POST `apply-oauth-credentials`）。
+/// 核心：执行写回（逐项 POST `apply-oauth-credentials`，成功后恢复调度开关）。
+///
+/// 上游在报 401 时会顺手把 `schedulable` 置 false（调度开关关闭、状态「暂停」），
+/// 而 `apply-oauth-credentials` 只清错误不恢复调度——所以写回成功后必须补一刀
+/// `POST /accounts/:id/schedulable {"schedulable":true}`，否则账号换完凭证仍然是暂停的。
 pub fn execute_plan(client: &mut Sub2ApiClient, plans: &[PlanItem]) -> Vec<ApplyOutcome> {
     let mut out = Vec::new();
     for p in plans {
@@ -278,12 +282,19 @@ pub fn execute_plan(client: &mut Sub2ApiClient, plans: &[PlanItem]) -> Vec<Apply
             "extra": p.extra,
         });
         match client.apply_oauth_credentials(p.account_id, &body) {
-            Ok(_) => out.push(ApplyOutcome {
-                account_id: p.account_id,
-                email: p.email.clone(),
-                ok: true,
-                message: "写回成功".to_string(),
-            }),
+            Ok(_) => {
+                // 恢复调度开关；失败不算写回失败，但要在结果里点名
+                let sched_msg = match client.set_schedulable(p.account_id, true) {
+                    Ok(_) => "调度已恢复".to_string(),
+                    Err(e) => format!("⚠️ 调度开关恢复失败（{}），请到后台手动打开", e),
+                };
+                out.push(ApplyOutcome {
+                    account_id: p.account_id,
+                    email: p.email.clone(),
+                    ok: true,
+                    message: format!("写回成功，{}", sched_msg),
+                });
+            }
             Err(e) => out.push(ApplyOutcome {
                 account_id: p.account_id,
                 email: p.email.clone(),

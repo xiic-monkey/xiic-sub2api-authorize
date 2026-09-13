@@ -170,6 +170,15 @@ impl Sub2ApiClient {
         self.request(reqwest::Method::POST, &path, Some(body))
     }
 
+    /// 设置账号是否可调度（= 管理页的「调度」开关）。
+    /// 端点：`POST /api/v1/admin/accounts/:id/schedulable`，body `{"schedulable": bool}`。
+    /// 上游 401 时 `SetError` 会顺手把 schedulable 置 false，重授权写回后需要把它打开。
+    pub fn set_schedulable(&mut self, account_id: i64, schedulable: bool) -> Result<serde_json::Value> {
+        let path = format!("admin/accounts/{}/schedulable", account_id);
+        let body = serde_json::json!({ "schedulable": schedulable });
+        self.request(reqwest::Method::POST, &path, Some(&body))
+    }
+
     /// 列出全部账号。用响应里的 `total` 字段翻页拉全，避免账号数超过单页上限被截断。
     pub fn list_accounts(&mut self) -> Result<Vec<Account>> {
         let mut all: Vec<Account> = Vec::new();
