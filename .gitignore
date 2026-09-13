@@ -2,6 +2,8 @@
 config.toml
 credentials.db
 *.db
+# 邮箱清单（含真实邮箱，勿提交）
+emails*.txt
 
 # 本地记忆（WorkBuddy），不进 git
 .workbuddy/
