@@ -9,7 +9,7 @@ struct Cli {
     #[arg(long, default_value = "config.toml")]
     config: String,
 
-    /// 浏览器引擎：`chrome`=唤醒本机 Google Chrome（不下载 Chromium）；缺省=playwright 内置 Chromium
+    /// 浏览器引擎：`chrome`=唤醒本机 Google Chrome；缺省=自动探测 chromium/chrome（服务器装 chromium 即可）
     #[arg(long, global = true)]
     browser: Option<String>,
 

@@ -1,163 +1,737 @@
-//! 无头浏览器封装（Playwright，与 xiic-crm 同构）。
+//! 原生浏览器自动化：纯 Rust CDP（chromiumoxide），**零 Node 依赖**。
 //!
-//! 本项目是 Rust 运维二进制，浏览器自动化交给同目录的 Node worker
-//! （`browser-worker/worker.js`，基于 playwright-core），由它驱动浏览器。
-//! 这样与 xiic-crm 技术栈一致，后期维护靠 playwright 生态。
+//! 直接以 headless 启动系统 Chrome / Chromium，走 DevTools 协议完成：
+//! - `open_and_shoot`：打开页面 + 截图 + 抽表单结构；
+//! - `gate`：门页状态检测（未进入 / 已记住会话），可填 CDK 进入；
+//! - `fetch` / `fetch_stream`：接码全流程——确保进入 → 填邮箱 → 点获取 →
+//!   每 5s 轮询 → 点「复制全部」读剪切板 → CPA 页转成 sub2api 凭证。
 //!
-//! - 不需要虚拟桌面：worker 内部 `headless: true`。
-//! - 引擎二选一（worker 的 `--browser`）：
-//!   - 默认 / `chromium`：playwright 内置 Chromium（由 `playwright-core install chromium` 管理，服务器/Docker 用）；
-//!   - `chrome`：直接唤醒本机已装的 Google Chrome（`channel: 'chrome'`），
-//!     不下载 Chromium，适合本地单机版（Tauri 桌面端默认用它）。
+//! 引擎定位：`SUB2OP_BROWSER` 环境变量 > `engine` 参数（"chrome"=本机 Chrome）>
+//! 依次探测 chromium / google-chrome / edge 等常见安装位置。
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
-use serde_json::Value;
+use anyhow::{anyhow, bail, Context, Result};
+use chromiumoxide::browser::Browser;
+use chromiumoxide::BrowserConfig;
+use serde_json::{json, Value};
+use tokio::time::{sleep, Duration};
 
-/// worker 所在目录：优先 `SUB2OP_ROOT`（容器/桌面端由外部注入），否则当前工作目录。
-/// 运维约定：从项目根目录运行本工具，worker 在 `browser-worker/worker.js`。
-pub fn worker_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("SUB2OP_ROOT") {
-        return PathBuf::from(p);
-    }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+/// fetch 过程的进度回调：`log` 收人类可读日志，`step` 收流程阶段（step 名与前端时间线对齐）。
+/// Arc 持有、Send + Sync，方便调用方放进线程池。
+#[derive(Clone)]
+pub struct FetchHooks {
+    pub log: Arc<dyn Fn(String) + Send + Sync>,
+    pub step: Arc<dyn Fn(&'static str, String) + Send + Sync>,
 }
 
-/// 定位 `browser-worker/worker.js`。Tauri 桌面端也用它，避免重复实现路径逻辑。
-pub fn worker_script() -> Result<PathBuf> {
-    let p = worker_dir().join("browser-worker/worker.js");
-    if !p.exists() {
-        anyhow::bail!(
-            "找不到浏览器 worker：{}\n提示：设 SUB2OP_ROOT=<含 browser-worker/ 的目录>；\
-             并在 browser-worker/ 下执行 npm install（playwright-core）。",
-            p.display()
-        );
+// ---------------------------------------------------------------------------
+// 浏览器可执行文件定位
+// ---------------------------------------------------------------------------
+
+fn which(name: &str) -> Option<PathBuf> {
+    let out = std::process::Command::new("which").arg(name).output().ok()?;
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(PathBuf::from(s));
+        }
     }
-    Ok(p)
+    None
 }
 
-/// 定位 node 可执行文件。
-///
-/// 关键：从 Finder / 启动台启动 GUI 时**不继承 shell 的 PATH**（不会 source .zshrc），
-/// 只查 PATH 会报 `No such file or directory (os error 2)`，所以按顺序兜底：
-/// 1. 环境变量 `SUB2OP_NODE`（桌面端设置 / 容器注入）；
-/// 2. PATH 里的 `node`（终端 / CLI 场景）；
-/// 3. 常见固定位置 + 托管版本目录（nvm / WorkBuddy 托管 / fnm，取版本号最新的）。
-pub fn node_bin() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("SUB2OP_NODE") {
+/// 按引擎偏好给出候选浏览器路径（从优到劣）。
+fn browser_candidates(engine: Option<&str>) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    // 显式指定优先
+    if let Ok(p) = std::env::var("SUB2OP_BROWSER") {
         let p = p.trim();
-        if !p.is_empty() && Path::new(p).exists() {
-            return Ok(PathBuf::from(p));
+        if !p.is_empty() {
+            v.push(PathBuf::from(p));
         }
     }
 
-    if let Ok(out) = Command::new("which").arg("node").output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() && Path::new(&s).exists() {
-                return Ok(PathBuf::from(s));
+    let e = engine.unwrap_or("").to_lowercase();
+    let chrome = |v: &mut Vec<PathBuf>| {
+        if let Some(p) = which("google-chrome") {
+            v.push(p);
+        }
+        if let Some(p) = which("google-chrome-stable") {
+            v.push(p);
+        }
+        v.push(PathBuf::from(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ));
+        v.push(PathBuf::from("/usr/bin/google-chrome"));
+    };
+    let chromium = |v: &mut Vec<PathBuf>| {
+        for name in ["chromium", "chromium-browser"] {
+            if let Some(p) = which(name) {
+                v.push(p);
+            }
+        }
+        v.push(PathBuf::from("/usr/bin/chromium"));
+        v.push(PathBuf::from("/usr/bin/chromium-browser"));
+        v.push(PathBuf::from("/snap/bin/chromium"));
+        v.push(PathBuf::from(
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ));
+    };
+    let edge = |v: &mut Vec<PathBuf>| {
+        if let Some(p) = which("microsoft-edge") {
+            v.push(p);
+        }
+        v.push(PathBuf::from(
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ));
+    };
+
+    match e.as_str() {
+        "chrome" => chrome(&mut v),
+        "chromium" | "" => {
+            chromium(&mut v);
+            chrome(&mut v);
+        }
+        "msedge" | "edge" => edge(&mut v),
+        other => {
+            if let Some(p) = which(other) {
+                v.push(p);
+            }
+            chromium(&mut v);
+            chrome(&mut v);
+        }
+    }
+    v
+}
+
+/// 找到第一个真实存在的浏览器可执行文件。
+pub fn detect_executable(engine: Option<&str>) -> Result<PathBuf> {
+    let cands = browser_candidates(engine);
+    if let Some(p) = cands.iter().find(|p| p.exists()) {
+        return Ok(p.clone());
+    }
+    bail!(
+        "找不到可用的浏览器引擎（engine={:?}）。已尝试：{}。\
+         可设置环境变量 SUB2OP_BROWSER=<浏览器可执行文件路径> 指定。",
+        engine.unwrap_or(""),
+        cands.iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("、")
+    );
+}
+
+/// 引擎可用性检测（桌面端「检测」按钮 / 服务器自检用）。
+pub fn check_engines() -> Value {
+    let mut out = serde_json::Map::new();
+    for (name, engine) in [("chrome", Some("chrome")), ("chromium", Some("chromium"))] {
+        match detect_executable(engine) {
+            Ok(p) => {
+                out.insert(name.to_string(), Value::Bool(true));
+                out.insert(format!("{}Path", name), json!(p.display().to_string()));
+                out.insert(format!("{}Error", name), Value::Null);
+            }
+            Err(e) => {
+                out.insert(name.to_string(), Value::Bool(false));
+                out.insert(format!("{}Path", name), Value::Null);
+                out.insert(format!("{}Error", name), json!(e.to_string()));
             }
         }
     }
+    Value::Object(out)
+}
 
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut candidates = vec![
-        PathBuf::from("/opt/homebrew/bin/node"),
-        PathBuf::from("/usr/local/bin/node"),
-    ];
-    for base in [
-        format!("{home}/.nvm/versions/node"),
-        format!("{home}/.workbuddy/binaries/node/versions"),
-        format!("{home}/Library/Application Support/fnm/node-versions"),
-    ] {
-        if let Some(bin) = latest_managed_node(Path::new(&base)) {
-            candidates.push(bin);
+// ---------------------------------------------------------------------------
+// CDP 基础设施
+// ---------------------------------------------------------------------------
+
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Runtime::new().expect("创建 tokio runtime 失败")
+}
+
+async fn launch(engine: Option<&str>) -> Result<Browser> {
+    let exe = detect_executable(engine)?;
+    let config = BrowserConfig::builder()
+        .chrome_executable(exe.clone())
+        .arg("--no-sandbox")
+        .arg("--disable-dev-shm-usage")
+        .arg("--disable-gpu")
+        .window_size(1366, 900)
+        .build()
+        .map_err(|e| anyhow!("浏览器配置失败：{}", e))?;
+    let (browser, mut handler) = Browser::launch(config)
+        .await
+        .with_context(|| format!("启动浏览器失败：{}", exe.display()))?;
+    // handler 负责泵 CDP 事件，必须常驻驱动，否则页面操作会挂起
+    tokio::task::spawn(async move {
+        use futures::StreamExt;
+        while let Some(_event) = handler.next().await {
+            // 事件仅驱动内部状态，无需处理
         }
-    }
+    });
+    Ok(browser)
+}
 
-    if let Some(b) = candidates.iter().find(|p| p.exists()) {
-        return Ok(b.clone());
+async fn goto(page: &chromiumoxide::Page, url: &str, errors: &mut Vec<String>) {
+    match tokio::time::timeout(Duration::from_secs(30), page.goto(url)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => errors.push(format!("goto: {}", e)),
+        Err(_) => errors.push(format!("goto: 超时（30s）：{}", url)),
     }
-    anyhow::bail!(
-        "找不到 Node.js。已尝试：PATH、/opt/homebrew/bin、/usr/local/bin、\
-         ~/.nvm/versions/node/*、~/.workbuddy/binaries/node/versions/*、fnm。\
-         可设置环境变量 SUB2OP_NODE=<node 路径> 指定。"
+}
+
+async fn eval_value(page: &chromiumoxide::Page, expr: &str) -> Result<Value> {
+    let res = page
+        .evaluate_expression(expr)
+        .await
+        .map_err(|e| anyhow!("执行页面脚本失败：{}", e))?;
+    Ok(res.into_value::<Value>().unwrap_or(Value::Null))
+}
+
+async fn eval_bool(page: &chromiumoxide::Page, expr: &str) -> bool {
+    matches!(eval_value(page, expr).await, Ok(Value::Bool(true)))
+}
+
+async fn eval_string(page: &chromiumoxide::Page, expr: &str) -> String {
+    match eval_value(page, expr).await {
+        Ok(Value::String(s)) => s,
+        _ => String::new(),
+    }
+}
+
+fn js_visible(sel: &str) -> String {
+    format!(
+        "(() => {{ const el = document.querySelector({s}); if (!el) return false; \
+         const r = el.getBoundingClientRect(); \
+         return !!(r.width || r.height) && getComputedStyle(el).visibility !== 'hidden'; }})()",
+        s = json!(sel)
     )
 }
 
-/// 在托管版本目录（nvm/fnm/WorkBuddy）里挑版本号最新的 node。
-/// 兼容两种布局：`<版本>/bin/node` 与 fnm 的 `<版本>/installation/bin/node`。
-fn latest_managed_node(base: &Path) -> Option<PathBuf> {
-    let mut best: Option<(String, PathBuf)> = None;
-    for entry in std::fs::read_dir(base).ok()?.flatten() {
-        let dir = entry.path();
-        for rel in ["bin/node", "installation/bin/node"] {
-            let bin = dir.join(rel);
-            if bin.exists() {
-                let key = entry.file_name().to_string_lossy().to_string();
-                if best.as_ref().map_or(true, |(k, _)| key > *k) {
-                    best = Some((key, bin));
-                }
-                break;
-            }
-        }
-    }
-    best.map(|(_, b)| b)
+async fn visible(page: &chromiumoxide::Page, sel: &str) -> bool {
+    eval_bool(page, &js_visible(sel)).await
 }
 
-/// 用定位到的 node 构造命令。
-fn node_command() -> Result<Command> {
-    Ok(Command::new(node_bin()?))
+async fn js_fill(page: &chromiumoxide::Page, sel: &str, value: &str) -> bool {
+    let expr = format!(
+        "(() => {{ const el = document.querySelector({s}); if (!el) return false; \
+         el.value = {v}; \
+         el.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+         el.dispatchEvent(new Event('change', {{ bubbles: true }})); \
+         return true; }})()",
+        s = json!(sel),
+        v = json!(value)
+    );
+    eval_bool(page, &expr).await
 }
 
-/// 追加浏览器引擎参数。`None` 时不下发，worker 用默认（内置 Chromium）。
-fn append_engine(cmd: &mut Command, engine: Option<&str>) {
-    if let Some(e) = engine {
-        if !e.is_empty() {
-            cmd.arg("--browser").arg(e);
-        }
-    }
+async fn js_click(page: &chromiumoxide::Page, sel: &str) -> bool {
+    let expr = format!(
+        "(() => {{ const el = document.querySelector({s}); if (!el) return false; el.click(); return true; }})()",
+        s = json!(sel)
+    );
+    eval_bool(page, &expr).await
 }
 
-fn spawn(mut cmd: Command) -> Result<()> {
-    let status = cmd.status().with_context(|| {
-        "启动 node worker 失败（确认 node 已安装、browser-worker 依赖已装：npm install）"
-    })?;
-    if !status.success() {
-        anyhow::bail!("浏览器 worker 退出异常：{:?}", status.code());
+async fn js_click_sub2api_channel(page: &chromiumoxide::Page) -> bool {
+    let expr = "(() => { const b = [...document.querySelectorAll('button')] \
+                .find(x => /sub2api/i.test(x.textContent || '')); \
+                if (!b) return false; b.click(); return true; })()";
+    eval_bool(page, expr).await
+}
+
+async fn js_text(page: &chromiumoxide::Page, sel: &str) -> String {
+    let expr = format!(
+        "(() => {{ const el = document.querySelector({s}); return el ? (el.textContent || '') : ''; }})()",
+        s = json!(sel)
+    );
+    eval_string(page, &expr).await
+}
+
+async fn js_input_value(page: &chromiumoxide::Page, sel: &str) -> String {
+    let expr = format!(
+        "(() => {{ const el = document.querySelector({s}); return el ? (el.value || '') : ''; }})()",
+        s = json!(sel)
+    );
+    eval_string(page, &expr).await
+}
+
+async fn js_enabled(page: &chromiumoxide::Page, sel: &str) -> bool {
+    let expr = format!(
+        "(() => {{ const el = document.querySelector({s}); return !!el && !el.disabled; }})()",
+        s = json!(sel)
+    );
+    eval_bool(page, &expr).await
+}
+
+const JS_MARKERS: &str = "(() => { const ids = ['gate','gateCdk','gateEnter','mergeBtn','mergeBanner','stat','jobs','work','go','left','newCdk','newLeft']; \
+                          const o = {}; for (const id of ids) { const el = document.getElementById(id); \
+                          let v = false; if (el) { const r = el.getBoundingClientRect(); \
+                          v = !!(r.width || r.height) && getComputedStyle(el).visibility !== 'hidden'; } o[id] = v; } return o; })()";
+
+const JS_FIELDS: &str = "(() => { const els = [...document.querySelectorAll('input,button,select,textarea,a[href]')]; \
+                         return els.map(e => ({ tag: e.tagName, type: e.getAttribute('type'), name: e.getAttribute('name'), \
+                         id: e.id, placeholder: e.getAttribute('placeholder'), text: (e.textContent || '').trim().slice(0, 48) })) \
+                         .filter(f => f.text || f.placeholder || f.type || f.tag === 'INPUT' || f.tag === 'BUTTON') \
+                         .slice(0, 80); })()";
+
+/// 探测「进入后」状态：正向标记（stat/work/go/left）任一可见，或门控件已隐藏。
+async fn is_entered(page: &chromiumoxide::Page) -> Result<(bool, Value)> {
+    let m = eval_value(page, JS_MARKERS).await?;
+    let truthy = |k: &str| m.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let marked = truthy("stat") || truthy("work") || truthy("go") || truthy("left");
+    let gate = visible(page, "#gateCdk").await && visible(page, "#gateEnter").await;
+    Ok((marked || !gate, m))
+}
+
+async fn screenshot(page: &chromiumoxide::Page, path: &Path) -> Result<()> {
+    let params = chromiumoxide::page::ScreenshotParams::builder()
+        .full_page(true)
+        .build();
+    let bytes = page
+        .screenshot(params)
+        .await
+        .with_context(|| format!("截图失败：{}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    std::fs::write(path, bytes)?;
     Ok(())
 }
 
-/// 无头打开 URL、截图、打印页面结构（实际由 node worker 执行）。
-pub fn open_and_shoot(url: &str, out: &Path, engine: Option<&str>) -> Result<()> {
-    let worker = worker_script()?;
-    let mut cmd = node_command()?;
-    cmd.arg(&worker).arg("open").arg(url).arg("--out").arg(out);
-    append_engine(&mut cmd, engine);
-    spawn(cmd)
+async fn grant_clipboard(page: &chromiumoxide::Page) {
+    use chromiumoxide::cdp::browser_protocol::browser::{GrantPermissionsParams, PermissionType};
+    let Ok(params) = GrantPermissionsParams::builder()
+        .permissions(vec![
+            PermissionType::ClipboardReadWrite,
+            PermissionType::ClipboardSanitizedWrite,
+        ])
+        .build()
+    else {
+        return;
+    };
+    let _ = page.execute(params).await;
 }
 
-/// 门页流程：检测 未进入/已进入 状态，若未进入且给了 CDK 则填 `#gateCdk` 并点 `#gateEnter`。
-/// `cdk` 为 None 时仅做状态检测（不填表、不点击），用于核对门页结构。
-pub fn gate(url: &str, cdk: Option<&str>, out_dir: &Path, engine: Option<&str>) -> Result<()> {
-    let worker = worker_script()?;
-    let mut cmd = node_command()?;
-    cmd.arg(&worker).arg("gate").arg(url).arg("--out-dir").arg(out_dir);
-    if let Some(c) = cdk {
-        cmd.arg("--cdk").arg(c);
+/// 读带回 Promise 的表达式（clipboard.readText 这类异步 API 用）。
+async fn eval_promise_string(page: &chromiumoxide::Page, expr: &str) -> String {
+    use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+    let Ok(params) = EvaluateParams::builder()
+        .expression(expr)
+        .await_promise(true)
+        .return_by_value(true)
+        .build()
+    else {
+        return String::new();
+    };
+    if let Ok(r) = page.execute(params).await {
+        if let Some(Value::String(s)) = r.result.result.value {
+            return s;
+        }
     }
-    append_engine(&mut cmd, engine);
-    spawn(cmd)
+    String::new()
 }
 
-/// 接码平台「获取令牌（重授权）→ 转 sub2api 凭证」完整链路：确保已进入 → 填邮箱(#emails) →
-/// 点获取(#go) → 每 5s 轮询 → 点「复制全部」(#copyAll) 从剪切板读结果 →
-/// 打开 CPA/Sub2API 页把结果贴进 #session-input → 读右边 #output 的 sub2api 凭证。
-/// **不落盘**：结果只经 worker 的 stdout JSON 返回，由调用方（终端/后续命令）消费。
+#[cfg(target_os = "macos")]
+fn system_clipboard() -> String {
+    std::process::Command::new("pbpaste")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_clipboard() -> String {
+    for cmd in [
+        vec!["xclip", "-selection", "clipboard", "-o"],
+        vec!["xsel", "-bo"],
+    ] {
+        if let Ok(o) = std::process::Command::new(cmd[0]).args(&cmd[1..]).output() {
+            if o.status.success() {
+                return String::from_utf8_lossy(&o.stdout).to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+// ---------------------------------------------------------------------------
+// 门页进入（gate / fetch 共用）
+// ---------------------------------------------------------------------------
+
+async fn ensure_entered(
+    page: &chromiumoxide::Page,
+    cdk: Option<&str>,
+    errors: &mut Vec<String>,
+    log: &dyn Fn(String),
+) -> Result<(bool, bool)> {
+    let gate_visible = visible(page, "#gateCdk").await && visible(page, "#gateEnter").await;
+    let (pre_entered, _) = is_entered(page).await?;
+    let at_gate = gate_visible && !pre_entered;
+
+    if at_gate {
+        match cdk.filter(|c| !c.trim().is_empty()) {
+            Some(c) => {
+                log("检测到门页：填入 CDK 并点击进入".to_string());
+                if !js_fill(page, "#gateCdk", c).await {
+                    errors.push("fill-gate: 填入 #gateCdk 失败".to_string());
+                }
+                if !js_click(page, "#gateEnter").await {
+                    errors.push("click-gate: 点击 #gateEnter 失败".to_string());
+                }
+                sleep(Duration::from_millis(3500)).await;
+            }
+            None => errors.push("no-cdk: 在门页但未提供 CDK，无法进入".to_string()),
+        }
+    } else if pre_entered {
+        log("页面记住了会话，已是进入后状态，跳过门页".to_string());
+    }
+
+    let (post_entered, _) = is_entered(page).await?;
+    Ok((at_gate, post_entered))
+}
+
+// ---------------------------------------------------------------------------
+// open：打开 + 截图 + 抽结构
+// ---------------------------------------------------------------------------
+
+async fn open_native(url: &str, out: &Path, engine: Option<&str>) -> Result<()> {
+    let browser = launch(engine).await?;
+    let page = browser.new_page("about:blank").await?;
+    let mut errors = Vec::new();
+    goto(&page, url, &mut errors).await;
+    sleep(Duration::from_millis(2500)).await;
+
+    screenshot(&page, out).await?;
+    let content = page.content().await.unwrap_or_default();
+    let fields = eval_value(&page, JS_FIELDS).await.unwrap_or(Value::Null);
+    let title = eval_string(&page, "document.title").await;
+
+    let result = json!({
+        "ok": true,
+        "url": eval_string(&page, "location.href").await,
+        "title": title,
+        "screenshot": out.display().to_string(),
+        "htmlBytes": content.len(),
+        "formFields": fields,
+        "errors": errors,
+    });
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+pub fn open_and_shoot(url: &str, out: &Path, engine: Option<&str>) -> Result<()> {
+    rt().block_on(open_native(url, out, engine))
+}
+
+// ---------------------------------------------------------------------------
+// gate：门页状态检测（± CDK 进入）
+// ---------------------------------------------------------------------------
+
+async fn gate_native(
+    url: &str,
+    cdk: Option<&str>,
+    out_dir: &Path,
+    engine: Option<&str>,
+    log: &dyn Fn(String),
+) -> Result<Value> {
+    std::fs::create_dir_all(out_dir).ok();
+    log(format!("打开门页：{}", url));
+    let browser = launch(engine).await?;
+    let page = browser.new_page("about:blank").await?;
+    let mut errors = Vec::new();
+    goto(&page, url, &mut errors).await;
+    sleep(Duration::from_millis(2500)).await;
+
+    let gate_visible = visible(&page, "#gateCdk").await && visible(&page, "#gateEnter").await;
+    let pre_shot = out_dir.join("gate-pre.png");
+    screenshot(&page, &pre_shot).await?;
+    let pre_fields = eval_value(&page, JS_FIELDS).await.unwrap_or(Value::Null);
+    let pre_html = page.content().await.unwrap_or_default();
+    let pre_html_path = out_dir.join("gate-pre.html");
+    let _ = std::fs::write(&pre_html_path, &pre_html);
+    let pre_title = eval_string(&page, "document.title").await;
+    let pre_markers = eval_value(&page, JS_MARKERS).await.unwrap_or(Value::Null);
+    let truthy = |v: &Value, k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let pre_entered = truthy(&pre_markers, "stat")
+        || truthy(&pre_markers, "work")
+        || truthy(&pre_markers, "go")
+        || truthy(&pre_markers, "left");
+    let has_gate = gate_visible && !pre_entered;
+
+    log(if has_gate {
+        "当前未进入（在门页）".to_string()
+    } else {
+        "当前已进入（页面记住了会话）".to_string()
+    });
+
+    let mut entered_with_cdk = false;
+    if has_gate {
+        match cdk.filter(|c| !c.trim().is_empty()) {
+            Some(c) => {
+                log("填入 CDK 并点击进入".to_string());
+                if !js_fill(&page, "#gateCdk", c).await {
+                    errors.push("fill: 填入 #gateCdk 失败".to_string());
+                }
+                if !js_click(&page, "#gateEnter").await {
+                    errors.push("click: 点击 #gateEnter 失败".to_string());
+                }
+                entered_with_cdk = true;
+                sleep(Duration::from_millis(3500)).await;
+            }
+            None => errors.push("no-cdk: 未进入且未提供 CDK，跳过填表/点击".to_string()),
+        }
+    }
+
+    let post_gate_visible =
+        visible(&page, "#gateCdk").await && visible(&page, "#gateEnter").await;
+    let post_markers = eval_value(&page, JS_MARKERS).await.unwrap_or(Value::Null);
+    let post_entered = truthy(&post_markers, "stat")
+        || truthy(&post_markers, "work")
+        || truthy(&post_markers, "go")
+        || truthy(&post_markers, "left");
+    let already_entered = post_entered || !post_gate_visible;
+
+    let post_shot = out_dir.join("gate-post.png");
+    screenshot(&page, &post_shot).await?;
+    let post_fields = eval_value(&page, JS_FIELDS).await.unwrap_or(Value::Null);
+    let post_html = page.content().await.unwrap_or_default();
+    let post_html_path = out_dir.join("gate-post.html");
+    let _ = std::fs::write(&post_html_path, &post_html);
+    let post_title = eval_string(&page, "document.title").await;
+
+    Ok(json!({
+        "ok": true,
+        "url": eval_string(&page, "location.href").await,
+        "detection": {
+            "preEntry": has_gate,
+            "postEntry": already_entered,
+            "enteredWithCdk": entered_with_cdk,
+        },
+        "pre": {
+            "title": pre_title,
+            "screenshot": pre_shot.display().to_string(),
+            "htmlFile": pre_html_path.display().to_string(),
+            "htmlBytes": pre_html.len(),
+            "fields": pre_fields,
+            "markers": pre_markers,
+        },
+        "post": {
+            "title": post_title,
+            "screenshot": post_shot.display().to_string(),
+            "htmlFile": post_html_path.display().to_string(),
+            "htmlBytes": post_html.len(),
+            "fields": post_fields,
+            "markers": post_markers,
+        },
+        "errors": errors,
+    }))
+}
+
+pub fn gate(url: &str, cdk: Option<&str>, out_dir: &Path, engine: Option<&str>) -> Result<()> {
+    let val = rt().block_on(gate_native(url, cdk, out_dir, engine, &|l| {
+        eprintln!("{}", l)
+    }))?;
+    println!("{}", serde_json::to_string_pretty(&val)?);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// fetch：接码全流程（进入 → 邮箱 → 轮询 → 复制 → CPA 转换）
+// ---------------------------------------------------------------------------
+
+async fn fetch_native(
+    url: &str,
+    emails: &[String],
+    cdk: Option<&str>,
+    max_ms: u64,
+    then_open: &str,
+    engine: Option<&str>,
+    hooks: &FetchHooks,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value> {
+    let log = |l: String| (hooks.log)(l);
+    if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+        bail!("已取消");
+    }
+    if emails.is_empty() {
+        bail!("邮箱列表为空，无法执行获取流程");
+    }
+
+    (hooks.step)("open", format!("打开门页：{}", url));
+    log("启动无头浏览器…".to_string());
+    let browser = launch(engine).await?;
+    let page = browser.new_page("about:blank").await?;
+    let mut errors = Vec::new();
+    goto(&page, url, &mut errors).await;
+    sleep(Duration::from_millis(2500)).await;
+
+    // 1) 确保已进入
+    let (pre_entry, post_entry) =
+        ensure_entered(&page, cdk, &mut errors, &|l| (hooks.log)(l)).await?;
+    if !post_entry {
+        bail!("未能进入页面（CDK 无效或页面结构变化）");
+    }
+    let entered = json!({ "preEntry": pre_entry, "postEntry": post_entry });
+
+    // 2) 填邮箱
+    (hooks.step)("emails", format!("填入 {} 个邮箱", emails.len()));
+    log(format!("填入 {} 个邮箱", emails.len()));
+    if !js_fill(&page, "#emails", &emails.join("\n")).await
+    {
+        errors.push("fill-emails: 填入 #emails 失败".to_string());
+    }
+
+    // 3) 点「获取令牌」
+    (hooks.step)("go", "已点击「获取令牌」，开始轮询（每 5 秒）".to_string());
+    log("已点击「获取令牌」，开始轮询（每 5 秒）".to_string());
+    if !js_click(&page, "#go").await {
+        errors.push("click-go: 点击 #go 失败".to_string());
+    }
+    let started = std::time::Instant::now();
+
+    // 4) 轮询：完成信号 = #stat 出完成字样，或 #dlAll/#copyAll 同时可用，或 #stat 连续 3 次不变
+    let mut poll_log: Vec<Value> = Vec::new();
+    let mut last_stat = String::new();
+    let mut stable = 0usize;
+    let mut done = false;
+    let mut final_state = Value::Null;
+
+    while started.elapsed().as_millis() < max_ms as u128 {
+        if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+            bail!("已取消");
+        }
+        sleep(Duration::from_millis(5000)).await;
+        let stat = js_text(&page, "#stat").await.trim().to_string();
+        let err_tx = js_text(&page, "#err").await.trim().to_string();
+        let emails_val = js_input_value(&page, "#emails").await;
+        let dl = js_enabled(&page, "#dlAll").await;
+        let cp = js_enabled(&page, "#copyAll").await;
+        let elapsed = started.elapsed().as_secs();
+        let snap = json!({
+            "t": format!("{}s", elapsed),
+            "stat": stat.chars().take(200).collect::<String>(),
+            "err": err_tx.chars().take(200).collect::<String>(),
+            "emailsLen": emails_val.chars().count(),
+            "dlAll": dl,
+            "copyAll": cp,
+        });
+        poll_log.push(snap.clone());
+        log(format!(
+            "[poll {}s] stat={} dlAll={} copyAll={}",
+            elapsed,
+            stat.chars().take(120).collect::<String>(),
+            dl,
+            cp
+        ));
+
+        let stat_l = stat.to_lowercase();
+        let words = ["完成", "成功", "结束", "已获取", "done", "finish"];
+        if words.iter().any(|w| stat_l.contains(w)) || (dl && cp) {
+            done = true;
+            final_state = snap;
+            break;
+        }
+        if !stat.is_empty() && stat == last_stat {
+            stable += 1;
+        } else {
+            stable = 0;
+        }
+        last_stat = stat;
+        if stable >= 3 {
+            done = true;
+            final_state = snap;
+            log("#stat 连续 3 次不变，视为完成/停滞".to_string());
+            break;
+        }
+    }
+    if !done {
+        final_state = json!({
+            "note": "超时未检测到完成信号",
+            "elapsed": format!("{}s", started.elapsed().as_secs()),
+        });
+    }
+    (hooks.step)("poll-done", if done { "检测到完成信号" } else { "超时结束" }.to_string());
+    log(if done {
+        "检测到完成信号".to_string()
+    } else {
+        "超时结束".to_string()
+    });
+
+    // 5) 点「复制全部」→ 读剪切板
+    (hooks.step)("copy", "点击「复制全部」并读取剪切板".to_string());
+    log("点击「复制全部」并读取剪切板".to_string());
+    grant_clipboard(&page).await;
+    let copy_clicked = js_click(&page, "#copyAll").await;
+    sleep(Duration::from_millis(800)).await;
+    let mut clipboard = eval_promise_string(&page, "navigator.clipboard.readText()").await;
+    if clipboard.trim().is_empty() {
+        clipboard = system_clipboard();
+    }
+    if clipboard.trim().is_empty() {
+        clipboard = js_input_value(&page, "#emails").await;
+        if !clipboard.trim().is_empty() {
+            errors.push("clipboard-empty: 回退 #emails 值".to_string());
+        }
+    }
+
+    // 6) CPA 页转换：贴 #session-input → 读 #output
+    (hooks.step)("cpa", "打开 CPA 页并转换（贴入 → 读取输出）".to_string());
+    log("打开 CPA 页并转换（贴入 → 读取输出）".to_string());
+    let mut cpa_page: Value = Value::Null;
+    match browser.new_page("about:blank").await {
+        Ok(p2) => {
+            grant_clipboard(&p2).await;
+            goto(&p2, then_open, &mut errors).await;
+            sleep(Duration::from_millis(2500)).await;
+            if !js_click_sub2api_channel(&p2).await {
+                errors.push("cpa-channel: 未找到 sub2api 渠道按钮".to_string());
+            }
+            if clipboard.trim().is_empty() {
+                errors.push("cpa: 剪切板为空，无法贴入 #session-input".to_string());
+            } else if !js_fill(&p2, "#session-input", &clipboard).await
+            {
+                errors.push("cpa-fill: 填入 #session-input 失败".to_string());
+            }
+            let mut cpa_out = String::new();
+            let t0 = std::time::Instant::now();
+            while t0.elapsed().as_millis() < 15000 {
+                sleep(Duration::from_millis(1500)).await;
+                cpa_out = js_input_value(&p2, "#output").await;
+                let low = cpa_out.to_lowercase();
+                if low.contains("refresh_token") || low.contains("rt-") {
+                    break;
+                }
+            }
+            let _ = js_click(&p2, "#copy-output").await;
+            cpa_page = json!({
+                "url": eval_string(&p2, "location.href").await,
+                "title": eval_string(&p2, "document.title").await,
+                "output": cpa_out,
+            });
+            let _ = p2.close().await;
+        }
+        Err(e) => errors.push(format!("cpa: {}", e)),
+    }
+
+    Ok(json!({
+        "ok": true,
+        "url": eval_string(&page, "location.href").await,
+        "entered": entered,
+        "emailsCount": emails.len(),
+        "done": done,
+        "finalState": final_state,
+        "copyClicked": copy_clicked,
+        "clipboard": clipboard,
+        "cpaPage": cpa_page,
+        "pollLog": poll_log,
+        "errors": errors,
+    }))
+}
+
+/// CLI 版 `fetch`：结果 JSON 打到 stdout。
 pub fn fetch(
     url: &str,
     emails_file: &Path,
@@ -166,34 +740,39 @@ pub fn fetch(
     then_open: Option<&str>,
     engine: Option<&str>,
 ) -> Result<()> {
-    let worker = worker_script()?;
     if !emails_file.exists() {
-        anyhow::bail!("邮箱清单文件不存在：{}", emails_file.display());
+        bail!("邮箱清单文件不存在：{}", emails_file.display());
     }
-
-    let mut cmd = node_command()?;
-    cmd.arg(&worker)
-        .arg("fetch")
-        .arg(url)
-        .arg("--emails-file")
-        .arg(emails_file)
-        .arg("--max")
-        .arg(max_ms.to_string());
-    if let Some(c) = cdk {
-        cmd.arg("--cdk").arg(c);
+    let raw = std::fs::read_to_string(emails_file)?;
+    let emails: Vec<String> = raw
+        .split(|c| c == '\n' || c == '\r' || c == ',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if emails.is_empty() {
+        bail!("邮箱清单为空：{}", emails_file.display());
     }
-    if let Some(t) = then_open {
-        cmd.arg("--then-open").arg(t);
-    }
-    append_engine(&mut cmd, engine);
-    spawn(cmd)
+    let then = then_open
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "https://zh.kyon888.xyz/CPAandSub2API/".to_string());
+    let val = rt().block_on(fetch_native(
+        url,
+        &emails,
+        cdk,
+        max_ms,
+        &then,
+        engine,
+        &FetchHooks {
+            log: Arc::new(|l| eprintln!("{}", l)),
+            step: Arc::new(|_, _| {}),
+        },
+        None,
+    ))?;
+    println!("{}", serde_json::to_string_pretty(&val)?);
+    Ok(())
 }
 
-/// 与 `fetch` 相同的链路，但**捕获 worker 输出**而不是打到终端：
-/// - 强制加 `--progress`，逐行读 NDJSON；进度通过 `on_log` 回调交给调用方（web 控制台日志）；
-/// - 返回 `done` 事件里的 result（`clipboard` 与 `cpaPage.output`），供后续按邮箱写回直接消费。
-///
-/// 邮箱直接以 `--emails` 换行串下发，不写临时文件。
+/// 流式版 `fetch`：只有日志回调（web 控制台用）。
 pub fn fetch_stream(
     url: &str,
     emails: &[String],
@@ -201,89 +780,31 @@ pub fn fetch_stream(
     max_ms: u64,
     then_open: Option<&str>,
     engine: Option<&str>,
-    on_log: &dyn Fn(String),
+    on_log: Arc<dyn Fn(String) + Send + Sync>,
 ) -> Result<Value> {
-    let worker = worker_script()?;
-    if emails.is_empty() {
-        anyhow::bail!("邮箱列表为空，无法执行获取流程");
-    }
+    let hooks = FetchHooks {
+        log: on_log,
+        step: Arc::new(|_, _| {}),
+    };
+    fetch_stream_hooks(url, emails, cdk, max_ms, then_open, engine, &hooks, None)
+}
 
-    let mut cmd = node_command()?;
-    cmd.arg(&worker)
-        .arg("fetch")
-        .arg(url)
-        .arg("--emails")
-        .arg(emails.join("\n"))
-        .arg("--max")
-        .arg(max_ms.to_string())
-        .arg("--progress")
-        .stdout(Stdio::piped());
-    if let Some(c) = cdk {
-        cmd.arg("--cdk").arg(c);
-    }
-    if let Some(t) = then_open {
-        cmd.arg("--then-open").arg(t);
-    }
-    append_engine(&mut cmd, engine);
-
-    let mut child = cmd.spawn().with_context(|| {
-        "启动 node worker 失败（确认 node 已安装、browser-worker 依赖已装：npm install）"
-    })?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("无法读取 worker 的 stdout（应为 piped）")?;
-
-    let mut result: Option<Value> = None;
-    let mut err_msg: Option<String> = None;
-    for line in BufReader::new(stdout).lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Value>(t) {
-            Ok(ev) => match ev.get("event").and_then(|v| v.as_str()).unwrap_or("") {
-                "done" => result = ev.get("result").cloned(),
-                "error" => {
-                    let m = ev
-                        .get("msg")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("未知错误")
-                        .to_string();
-                    err_msg = Some(m.clone());
-                    on_log(format!("❌ {}", m));
-                }
-                _ => {
-                    let msg = ev.get("msg").and_then(|v| v.as_str()).unwrap_or("");
-                    if !msg.is_empty() {
-                        let step = ev.get("step").and_then(|v| v.as_str()).unwrap_or("");
-                        if step.is_empty() {
-                            on_log(msg.to_string());
-                        } else {
-                            on_log(format!("[{}] {}", step, msg));
-                        }
-                    }
-                }
-            },
-            Err(_) => on_log(t.to_string()),
-        }
-    }
-
-    let status = child.wait().context("等待浏览器 worker 结束失败")?;
-    if let Some(r) = result {
-        return Ok(r);
-    }
-    if !status.success() {
-        let tail = err_msg.map(|e| format!("：{}", e)).unwrap_or_default();
-        anyhow::bail!(
-            "浏览器 worker 退出异常（code={:?}){}",
-            status.code(),
-            tail
-        );
-    }
-    Err(anyhow!("浏览器 worker 没有返回结果 JSON"))
+/// 全功能版 `fetch`：日志 + 阶段回调 + 取消标记（Tauri 桌面端用）。
+/// 取消后下一次轮询前退出（最多 5 秒），浏览器随 Browser drop 一并关闭。
+pub fn fetch_stream_hooks(
+    url: &str,
+    emails: &[String],
+    cdk: Option<&str>,
+    max_ms: u64,
+    then_open: Option<&str>,
+    engine: Option<&str>,
+    hooks: &FetchHooks,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value> {
+    let then = then_open
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "https://zh.kyon888.xyz/CPAandSub2API/".to_string());
+    rt().block_on(fetch_native(
+        url, emails, cdk, max_ms, &then, engine, hooks, cancel,
+    ))
 }

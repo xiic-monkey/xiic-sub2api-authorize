@@ -26,3 +26,6 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = "0.4"
+# 原生浏览器自动化：纯 Rust CDP 客户端，直接驱动系统 Chrome/Chromium（零 Node）
+chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
+futures = "0.3"

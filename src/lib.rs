@@ -9,7 +9,7 @@
 //! - [`models`]  账号 DTO
 //! - [`config`]  config.toml 读写
 //! - [`store`]   本地凭证库（账号 / 密码 / CDK）
-//! - [`browser`] Node playwright worker 封装（门页 / 获取令牌流程）
+//! - [`browser`] 原生浏览器自动化（chromiumoxide 直连系统 Chrome/Chromium 的 CDP，零 Node）
 //! - [`commands`] CLI 侧的流程编排（账号列表、重授权写回）
 //! - [`totp`]    2FA 验证码
 //! - [`web`]     本地凭证录入页（axum）

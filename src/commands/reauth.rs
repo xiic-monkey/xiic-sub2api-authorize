@@ -454,6 +454,7 @@ pub fn run_once(client: &mut Sub2ApiClient, opts: OnceOpts, log: &Logger) -> Res
         "启动无头浏览器：门页 → 填邮箱 → 获取令牌（最长等待 {}s）",
         opts.max_ms / 1000
     ));
+    let logger = Arc::clone(log);
     let out = browser::fetch_stream(
         opts.gate_url,
         &emails,
@@ -461,7 +462,7 @@ pub fn run_once(client: &mut Sub2ApiClient, opts: OnceOpts, log: &Logger) -> Res
         opts.max_ms,
         Some(opts.cpa_url),
         opts.engine,
-        &|line| log(line),
+        Arc::new(move |l| logger(l)),
     )?;
 
     // 结果优先取 CPA 转换输出（已是 sub2api 凭证，含 refresh_token），否则退回剪切板原文

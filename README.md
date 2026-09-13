@@ -33,8 +33,9 @@ cargo run -- reauth detect              # 检测需要重授权的账号
 cargo run -- browser fetch <门页URL> --emails-file emails.txt   # 单跑接码流程
 ```
 
-浏览器引擎：默认用 playwright 内置 Chromium（服务器/Docker 适用）；
-加 `--browser chrome` 直接唤醒本机已装的 Google Chrome，不下载 Chromium。
+浏览器自动化是**纯 Rust 原生实现**（chromiumoxide 直连 Chrome 的 CDP 协议，零 Node 依赖）。
+引擎自动探测：本机 Google Chrome / Chromium / Edge 任装其一即可；
+服务器（Docker）里已内置 Debian 的 chromium。也可用 `--browser chrome` 或环境变量 `SUB2OP_BROWSER=<路径>` 指定。
 
 ## 配置
 
