@@ -151,10 +151,24 @@ fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().expect("创建 tokio runtime 失败")
 }
 
-async fn launch(engine: Option<&str>) -> Result<Browser> {
+/// 启动浏览器，返回 (Browser, 本次专用的 user-data-dir)。
+///
+/// **每次运行用独立临时目录**：Chrome 对 user-data-dir 有单例锁（SingletonLock），
+/// 共用固定目录时，上一次没退干净的残留进程会让下一次启动直接自杀
+/// （"File exists ... ProcessSingleton ... Aborting"）。独立目录 + 用完即删根治。
+/// 异常路径可能残留目录，但位于系统临时目录下、目录名唯一，无害且会被系统定期清理。
+async fn launch(engine: Option<&str>) -> Result<(Browser, PathBuf)> {
     let exe = detect_executable(engine)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let user_data_dir = std::env::temp_dir().join(format!("sub2op-chrome-{}-{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&user_data_dir)
+        .with_context(|| format!("创建临时 profile 目录失败：{}", user_data_dir.display()))?;
     let config = BrowserConfig::builder()
         .chrome_executable(exe.clone())
+        .user_data_dir(&user_data_dir)
         .arg("--no-sandbox")
         .arg("--disable-dev-shm-usage")
         .arg("--disable-gpu")
@@ -171,7 +185,15 @@ async fn launch(engine: Option<&str>) -> Result<Browser> {
             // 事件仅驱动内部状态，无需处理
         }
     });
-    Ok(browser)
+    Ok((browser, user_data_dir))
+}
+
+/// 浏览器会话结束后的收尾：确保浏览器已关闭并删除本次的临时 profile 目录（best-effort）。
+fn cleanup_browser(browser: Browser, dir: &Path) {
+    drop(browser);
+    // Chrome 退出是异步的，稍等一下再删，删不掉就留给系统清理
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 async fn goto(page: &chromiumoxide::Page, url: &str, errors: &mut Vec<String>) {
@@ -398,7 +420,8 @@ async fn ensure_entered(
 // ---------------------------------------------------------------------------
 
 async fn open_native(url: &str, out: &Path, engine: Option<&str>) -> Result<()> {
-    let browser = launch(engine).await?;
+    let (browser, profile_dir) = launch(engine).await?;
+    let res: Result<()> = async {
     let page = browser.new_page("about:blank").await?;
     let mut errors = Vec::new();
     goto(&page, url, &mut errors).await;
@@ -420,6 +443,10 @@ async fn open_native(url: &str, out: &Path, engine: Option<&str>) -> Result<()> 
     });
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+    }
+    .await;
+    cleanup_browser(browser, &profile_dir);
+    res
 }
 
 pub fn open_and_shoot(url: &str, out: &Path, engine: Option<&str>) -> Result<()> {
@@ -439,7 +466,8 @@ async fn gate_native(
 ) -> Result<Value> {
     std::fs::create_dir_all(out_dir).ok();
     log(format!("打开门页：{}", url));
-    let browser = launch(engine).await?;
+    let (browser, profile_dir) = launch(engine).await?;
+    let res: Result<Value> = async {
     let page = browser.new_page("about:blank").await?;
     let mut errors = Vec::new();
     goto(&page, url, &mut errors).await;
@@ -528,6 +556,10 @@ async fn gate_native(
         },
         "errors": errors,
     }))
+    }
+    .await;
+    cleanup_browser(browser, &profile_dir);
+    res
 }
 
 pub fn gate(url: &str, cdk: Option<&str>, out_dir: &Path, engine: Option<&str>) -> Result<()> {
@@ -562,7 +594,8 @@ async fn fetch_native(
 
     (hooks.step)("open", format!("打开门页：{}", url));
     log("启动无头浏览器…".to_string());
-    let browser = launch(engine).await?;
+    let (browser, profile_dir) = launch(engine).await?;
+    let res: Result<Value> = async {
     let page = browser.new_page("about:blank").await?;
     let mut errors = Vec::new();
     goto(&page, url, &mut errors).await;
@@ -729,6 +762,10 @@ async fn fetch_native(
         "pollLog": poll_log,
         "errors": errors,
     }))
+    }
+    .await;
+    cleanup_browser(browser, &profile_dir);
+    res
 }
 
 /// CLI 版 `fetch`：结果 JSON 打到 stdout。
