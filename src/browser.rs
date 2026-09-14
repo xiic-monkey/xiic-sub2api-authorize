@@ -686,13 +686,9 @@ async fn fetch_native(
         let copy_visible = visible(&page, "#copyAll").await;
         let elapsed = started.elapsed().as_secs();
 
-        // 完成判定：必须同时满足
-        // 1) #stat 文案里「共 N 个」的 N > 0（批次确实在跑）
-        // 2) #stat 文案里「进行中 Z」的 Z == 0（没有还在跑的子任务）
-        // 3) #copyAll 按钮可见（去掉 hidden，而不是 disabled；一开始按钮 hidden，完成后才显示）
-        // 注意：stat 文案固定为「共 N 个 · 成功 X · 失败 Y · 进行中 Z」，「成功」二字永远存在——
-        // 绝不能用关键词 contains 判定（第一次轮询「进行中 1」也会命中「成功」，之前就栽在这）。
-        // 也不能只看 enabled：按钮由 hidden 控制，初始就 enabled。
+        // 完成判定：批次已开始（total>0）且没有仍在进行的子任务（live==0）即可。
+        // 不需要成功 > 0，也不需要 #copyAll 可见——页面可能是全部失败，
+        // 此时 copyAll 仍 hidden，但任务已结束，应该继续下一步（读剪切板 / CPA 转换）。
         let num_after = |key: &str| -> Option<u64> {
             let idx = stat.find(key)?;
             let rest = stat[idx + key.len()..].trim_start();
@@ -726,14 +722,15 @@ async fn fetch_native(
             live
         ));
 
-        if total.unwrap_or(0) > 0 && live == Some(0) && copy_visible {
+        if total.unwrap_or(0) > 0 && live == Some(0) {
             done = true;
             final_state = snap;
             log(format!(
-                "批次结束：成功 {} / 失败 {} / 共 {}",
+                "批次结束：成功 {} / 失败 {} / 共 {}（copyAll 可见={}）",
                 ok_n.unwrap_or(0),
                 err_n.unwrap_or(0),
-                total.unwrap_or(0)
+                total.unwrap_or(0),
+                copy_visible
             ));
             break;
         }
@@ -743,12 +740,11 @@ async fn fetch_native(
             stable = 0;
         }
         last_stat = stat;
-        // 兜底：stat 连续 3 次不变，且批次确实在跑（total>0）且「复制全部」按钮已显示。
-        // 这里不再要求 live 必须解析不到，避免模板没变、主条件已满足时由于抖动错过。
-        if stable >= 3 && total.unwrap_or(0) > 0 && copy_visible {
+        // 兜底：stat 连续 3 次不变，且批次确实在跑（total>0），视为完成。
+        if stable >= 3 && total.unwrap_or(0) > 0 {
             done = true;
             final_state = snap;
-            log("#stat 连续 3 次不变且复制全部按钮已显示，视为完成".to_string());
+            log("#stat 连续 3 次不变，视为完成".to_string());
             break;
         }
     }
