@@ -186,6 +186,34 @@ impl Sub2ApiClient {
         self.request(reqwest::Method::DELETE, &path, None)
     }
 
+    /// 批量更新账号属性。
+    /// 端点：`POST /api/v1/admin/accounts/bulk-update`，body `{"account_ids": [...] , <字段>}`。
+    /// 目前只用于设置 `priority`（同一批账号设为同一优先级）。
+    pub fn bulk_update(
+        &mut self,
+        account_ids: &[i64],
+        field: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "account_ids": account_ids,
+            "priority": field,
+        });
+        self.request(reqwest::Method::POST, "admin/accounts/bulk-update", Some(&body))
+    }
+
+    /// 把一批账号的优先级统一设为 `priority`（sub2api 里数字越小越优先）。
+    pub fn set_priority_bulk(&mut self, account_ids: &[i64], priority: i64) -> Result<serde_json::Value> {
+        self.bulk_update(account_ids, &serde_json::json!(priority))
+    }
+
+    /// 单个账号设优先级（批量端点不可用时的兜底）。
+    /// 端点：`PUT /api/v1/admin/accounts/:id`，body `{"priority": n}`。
+    pub fn set_priority_one(&mut self, account_id: i64, priority: i64) -> Result<serde_json::Value> {
+        let path = format!("admin/accounts/{}", account_id);
+        let body = serde_json::json!({ "priority": priority });
+        self.request(reqwest::Method::PUT, &path, Some(&body))
+    }
+
     /// 列出全部账号。用响应里的 `total` 字段翻页拉全，避免账号数超过单页上限被截断。
     pub fn list_accounts(&mut self) -> Result<Vec<Account>> {
         let mut all: Vec<Account> = Vec::new();

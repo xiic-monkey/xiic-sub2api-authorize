@@ -26,6 +26,9 @@ pub struct Account {
     pub expires_at: Option<i64>,
     #[serde(default)]
     pub schedulable: bool,
+    /// 调度优先级（sub2api 原生字段，越小越优先）。缺失则为 None。
+    #[serde(default, rename = "priority")]
+    pub priority: Option<i64>,
     /// 原始 OAuth 凭证（apply 写回时作兜底，缺字段时保留现有值）。缺失则为 None。
     #[serde(default)]
     pub credentials: Option<Value>,
