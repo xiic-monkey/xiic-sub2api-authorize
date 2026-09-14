@@ -878,3 +878,204 @@ pub fn fetch_stream_hooks(
         url, emails, cdk, max_ms, &then, engine, hooks, cancel,
     ))
 }
+
+// ---------------------------------------------------------------------------
+// CDK 查询次数
+// ---------------------------------------------------------------------------
+
+async fn check_cdk_native(
+    url: &str,
+    cdk: &str,
+    engine: Option<&str>,
+    hooks: &FetchHooks,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value> {
+    let log = |l: String| (hooks.log)(l);
+    if cdk.trim().is_empty() {
+        bail!("未保存 CDK，请先填写并保存 CDK");
+    }
+    if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+        bail!("已取消");
+    }
+
+    (hooks.step)("open", format!("打开门页：{}", url));
+    log("启动无头浏览器…".to_string());
+    let (browser, profile_dir) = launch(engine).await?;
+    let res: Result<Value> = async {
+        let page = browser.new_page("about:blank").await?;
+        let mut errors = Vec::new();
+        goto(&page, url, &mut errors).await;
+        sleep(Duration::from_millis(2500)).await;
+
+        let (_, entered) = ensure_entered(&page, Some(cdk), &mut errors, &|l| (hooks.log)(l)).await?;
+        if !entered {
+            bail!("未能进入页面（CDK 无效或页面结构变化）");
+        }
+
+        // 确保查询框里的 CDK 就是我们要查的那张
+        js_fill(&page, "#cdk", cdk).await;
+        (hooks.step)("check", format!("查询 CDK 剩余次数：{}", cdk));
+        log(format!("查询 CDK 剩余次数：{}", cdk));
+        if !js_click(&page, "#chk").await {
+            bail!("点击 #chk（查询次数）失败");
+        }
+
+        let t0 = std::time::Instant::now();
+        let mut left_text = String::new();
+        let mut err_text = String::new();
+        while t0.elapsed().as_millis() < 30000 {
+            if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+                bail!("已取消");
+            }
+            sleep(Duration::from_millis(1000)).await;
+            left_text = js_text(&page, "#left").await.trim().to_string();
+            err_text = js_text(&page, "#err").await.trim().to_string();
+            if !left_text.is_empty() || !err_text.is_empty() {
+                break;
+            }
+        }
+
+        if !err_text.is_empty() {
+            bail!("查询失败：{}", err_text);
+        }
+        if left_text.is_empty() {
+            bail!("查询超时，未拿到剩余次数");
+        }
+
+        // 解析 "剩余 N / M 次" 或 "剩余 N 次"
+        let parse_nums = |s: &str| -> (Option<u64>, Option<u64>) {
+            let rest = s.trim().strip_prefix("剩余").unwrap_or(s).trim();
+            let rest = rest.strip_suffix("次").unwrap_or(rest).trim();
+            let mut parts = rest.split('/');
+            let a = parts.next().and_then(|x| x.trim().parse::<u64>().ok());
+            let b = parts.next().and_then(|x| x.trim().parse::<u64>().ok());
+            (a, b)
+        };
+        let (remaining, quota) = parse_nums(&left_text);
+
+        (hooks.step)("check-done", format!("{}：{}", cdk, left_text));
+        log(format!("查询结果：{}", left_text));
+
+        Ok(json!({
+            "ok": true,
+            "cdk": cdk,
+            "remaining": remaining,
+            "quota": quota,
+            "left_text": left_text,
+            "errors": errors,
+        }))
+    }
+    .await;
+    cleanup_browser(browser, &profile_dir);
+    res
+}
+
+/// 查询单张 CDK 的剩余次数。
+pub fn check_cdk_left(
+    url: &str,
+    cdk: &str,
+    engine: Option<&str>,
+    hooks: &FetchHooks,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value> {
+    rt().block_on(check_cdk_native(url, cdk, engine, hooks, cancel))
+}
+
+// ---------------------------------------------------------------------------
+// CDK 合并
+// ---------------------------------------------------------------------------
+
+async fn merge_cdk_native(
+    url: &str,
+    codes: &[String],
+    engine: Option<&str>,
+    hooks: &FetchHooks,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value> {
+    let log = |l: String| (hooks.log)(l);
+    if codes.len() < 2 {
+        bail!("至少需要两张 CDK 才能合并");
+    }
+    if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+        bail!("已取消");
+    }
+
+    let first = codes[0].trim();
+    let other: Vec<String> = codes.iter().skip(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+
+    (hooks.step)("open", format!("打开门页：{}", url));
+    log("启动无头浏览器…".to_string());
+    let (browser, profile_dir) = launch(engine).await?;
+    let res: Result<Value> = async {
+        let page = browser.new_page("about:blank").await?;
+        let mut errors = Vec::new();
+        goto(&page, url, &mut errors).await;
+        sleep(Duration::from_millis(2500)).await;
+
+        // 用第一张 CDK 进入；进入后页面会自动把它填入 #cdk/#gateCdk
+        let (_, entered) = ensure_entered(&page, Some(first), &mut errors, &|l| (hooks.log)(l)).await?;
+        if !entered {
+            bail!("未能进入页面（CDK 无效或页面结构变化）");
+        }
+
+        // 把其余 CDK 填入合并输入框；页面 mergeBtn 会自动加上 #cdk 和 #gateCdk 的值
+        let merge_input = other.join("\n");
+        (hooks.step)("merge", format!("合并 {} 张 CDK", codes.len()));
+        log(format!("填入合并 CDK（共 {} 张）：\\n{}", codes.len(), merge_input.replace('\n', ", ")));
+        if !js_fill(&page, "#mergeCodes", &merge_input).await {
+            bail!("填入 #mergeCodes 失败");
+        }
+
+        if !js_click(&page, "#mergeBtn").await {
+            bail!("点击 #mergeBtn 失败");
+        }
+
+        let t0 = std::time::Instant::now();
+        let mut new_cdk = String::new();
+        let mut new_left = String::new();
+        while t0.elapsed().as_millis() < 60000 {
+            if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+                bail!("已取消");
+            }
+            sleep(Duration::from_millis(1000)).await;
+            new_cdk = js_text(&page, "#newCdk").await.trim().to_string();
+            new_left = js_text(&page, "#newLeft").await.trim().to_string();
+            let merge_err = js_text(&page, "#mergeErr").await.trim().to_string();
+            let banner_visible = visible(&page, "#mergeBanner").await;
+            if banner_visible && !new_cdk.is_empty() {
+                break;
+            }
+            if !merge_err.is_empty() {
+                bail!("合并失败：{}", merge_err);
+            }
+        }
+
+        if new_cdk.is_empty() {
+            bail!("合并超时，未拿到新 CDK");
+        }
+
+        (hooks.step)("merge-done", format!("新 CDK：{}{}", new_cdk, new_left));
+        log(format!("合并完成，新 CDK：{}{}", new_cdk, new_left));
+
+        Ok(json!({
+            "ok": true,
+            "new_cdk": new_cdk,
+            "new_left": new_left,
+            "errors": errors,
+        }))
+    }
+    .await;
+    cleanup_browser(browser, &profile_dir);
+    res
+}
+
+/// 合并多张 CDK 为一张新 CDK。
+pub fn merge_cdk(
+    url: &str,
+    codes: &[String],
+    engine: Option<&str>,
+    hooks: &FetchHooks,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value> {
+    rt().block_on(merge_cdk_native(url, codes, engine, hooks, cancel))
+}
