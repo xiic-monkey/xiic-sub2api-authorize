@@ -290,6 +290,17 @@ async fn js_enabled(page: &chromiumoxide::Page, sel: &str) -> bool {
     eval_bool(page, &expr).await
 }
 
+async fn extract_banned_emails(page: &chromiumoxide::Page) -> Vec<String> {
+    match eval_value(page, JS_EXTRACT_BANNED).await {
+        Ok(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_lowercase()))
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 const JS_MARKERS: &str = "(() => { const ids = ['gate','gateCdk','gateEnter','mergeBtn','mergeBanner','stat','jobs','work','go','left','newCdk','newLeft']; \
                           const o = {}; for (const id of ids) { const el = document.getElementById(id); \
                           let v = false; if (el) { const r = el.getBoundingClientRect(); \
@@ -300,6 +311,34 @@ const JS_FIELDS: &str = "(() => { const els = [...document.querySelectorAll('inp
                          id: e.id, placeholder: e.getAttribute('placeholder'), text: (e.textContent || '').trim().slice(0, 48) })) \
                          .filter(f => f.text || f.placeholder || f.type || f.tag === 'INPUT' || f.tag === 'BUTTON') \
                          .slice(0, 80); })()";
+
+/// 从 401 结果页提取「账号已被封禁/停用」的邮箱列表。
+/// 先按结果项容器扫描，再兜底扫描全页文本。
+const JS_EXTRACT_BANNED: &str = r#"(() => {
+  const keywords = ['封禁','停用','deactivated','banned','suspended','disabled'];
+  const emailRe = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+  const banned = new Set();
+  const hasBanWord = (s) => s && keywords.some(k => s.toLowerCase().includes(k.toLowerCase()));
+  const containers = document.querySelectorAll('#jobs > *, #work > *, #stat > *, [class*="result"], [class*="item"], [class*="card"], [class*="row"], [class*="job"]');
+  for (const el of containers) {
+    const text = (el.innerText || '').toLowerCase();
+    if (hasBanWord(text)) {
+      const emails = ((el.innerText || '').match(emailRe) || []);
+      for (const email of emails) banned.add(email.toLowerCase());
+    }
+  }
+  if (banned.size === 0 && document.body) {
+    const bodyText = document.body.innerText || '';
+    const emails = [...bodyText.matchAll(emailRe)].map(m => m[0]);
+    for (const email of emails) {
+      const idx = bodyText.indexOf(email);
+      if (idx < 0) continue;
+      const surrounding = bodyText.substring(Math.max(0, idx - 200), Math.min(bodyText.length, idx + 300));
+      if (hasBanWord(surrounding)) banned.add(email.toLowerCase());
+    }
+  }
+  return [...banned];
+})()"#;
 
 /// 探测「进入后」状态：正向标记（stat/work/go/left）任一可见，或门控件已隐藏。
 async fn is_entered(page: &chromiumoxide::Page) -> Result<(bool, Value)> {
@@ -743,7 +782,13 @@ async fn fetch_native(
         }
     }
 
-    // 6) CPA 页转换：贴 #session-input → 读 #output
+    // 6) 提取可能被封禁/停用的账号邮箱
+    let banned_emails = extract_banned_emails(&page).await;
+    if !banned_emails.is_empty() {
+        log(format!("检测到被封禁/停用账号：{}", banned_emails.join(", ")));
+    }
+
+    // 7) CPA 页转换：贴 #session-input → 读 #output
     (hooks.step)("cpa", "打开 CPA 页并转换（贴入 → 读取输出）".to_string());
     log("打开 CPA 页并转换（贴入 → 读取输出）".to_string());
     let mut cpa_page: Value = Value::Null;
@@ -792,6 +837,7 @@ async fn fetch_native(
         "copyClicked": copy_clicked,
         "clipboard": clipboard,
         "cpaPage": cpa_page,
+        "bannedEmails": banned_emails,
         "pollLog": poll_log,
         "errors": errors,
     }))

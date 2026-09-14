@@ -78,6 +78,15 @@ pub struct ApplyOutcome {
     pub message: String,
 }
 
+/// 单个账号的删除结果（用于 fetch 检测到封禁/停用时）。
+#[derive(Debug, Clone, Serialize)]
+pub struct DeleteOutcome {
+    pub account_id: i64,
+    pub email: String,
+    pub ok: bool,
+    pub message: String,
+}
+
 /// 写回报告（Tauri 返回给前端的结构）。
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplyReport {
@@ -268,6 +277,46 @@ pub fn build_plan(
     })
 }
 
+/// 一键流程辅助：把 fetch 检测到的被封禁/停用邮箱从 sub2api 删除。
+pub fn delete_banned_accounts(
+    client: &mut Sub2ApiClient,
+    accounts: &[Account],
+    banned: &[String],
+    log: &Logger,
+) -> Vec<DeleteOutcome> {
+    let mut out = Vec::new();
+    for email in banned {
+        let target = match find_account(accounts, email) {
+            Some(a) => a,
+            None => {
+                log(format!("未找到对应 sub2api 账号，跳过删除：{}", email));
+                continue;
+            }
+        };
+        match client.delete_account(target.id) {
+            Ok(_) => {
+                log(format!("已删除被封禁账号 #{} {}", target.id, email));
+                out.push(DeleteOutcome {
+                    account_id: target.id,
+                    email: email.clone(),
+                    ok: true,
+                    message: "已删除".to_string(),
+                });
+            }
+            Err(e) => {
+                log(format!("删除账号 #{} {} 失败：{}", target.id, email, e));
+                out.push(DeleteOutcome {
+                    account_id: target.id,
+                    email: email.clone(),
+                    ok: false,
+                    message: format!("{}", e),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// 核心：执行写回（逐项 POST `apply-oauth-credentials`，成功后恢复调度开关）。
 ///
 /// 上游在报 401 时会顺手把 `schedulable` 置 false（调度开关关闭、状态「暂停」），
@@ -425,6 +474,10 @@ pub struct OnceResult {
     pub raw_len: usize,
     /// 写回报告（dry_run / plans / outcomes / skipped）
     pub report: ApplyReport,
+    /// fetch 结果页检测到的被封禁/停用邮箱
+    pub banned_emails: Vec<String>,
+    /// 已执行的删除结果
+    pub deleted: Vec<DeleteOutcome>,
 }
 
 /// 一键重授权：**自动找出需要重授权的账号 → 无头浏览器跑接码 → 结果按邮箱写回**。
@@ -496,6 +549,23 @@ pub fn run_once(client: &mut Sub2ApiClient, opts: OnceOpts, log: &Logger) -> Res
     }
     log(format!("拿到结果（{} 字符），开始按邮箱匹配写回", raw.len()));
 
+    // 先处理被封禁/停用的账号：从 sub2api 直接删除，避免继续写回或调度
+    let banned_emails: Vec<String> = out
+        .get("bannedEmails")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_lowercase()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let deleted = if !banned_emails.is_empty() {
+        delete_banned_accounts(client, &accounts, &banned_emails, log)
+    } else {
+        Vec::new()
+    };
+
     let report = apply_value(client, &raw, opts.yes, None, opts.only_email)?;
 
     if opts.yes {
@@ -526,6 +596,8 @@ pub fn run_once(client: &mut Sub2ApiClient, opts: OnceOpts, log: &Logger) -> Res
         emails,
         raw_len: raw.len(),
         report,
+        banned_emails,
+        deleted,
     })
 }
 

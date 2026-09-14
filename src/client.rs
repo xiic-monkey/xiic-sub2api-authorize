@@ -179,6 +179,13 @@ impl Sub2ApiClient {
         self.request(reqwest::Method::POST, &path, Some(&body))
     }
 
+    /// 删除指定账号（用于账号已被封禁/停用等无法继续使用的场景）。
+    /// 端点：`DELETE /api/v1/admin/accounts/:id`。
+    pub fn delete_account(&mut self, account_id: i64) -> Result<serde_json::Value> {
+        let path = format!("admin/accounts/{}", account_id);
+        self.request(reqwest::Method::DELETE, &path, None)
+    }
+
     /// 列出全部账号。用响应里的 `total` 字段翻页拉全，避免账号数超过单页上限被截断。
     pub fn list_accounts(&mut self) -> Result<Vec<Account>> {
         let mut all: Vec<Account> = Vec::new();
