@@ -740,11 +740,13 @@ async fn fetch_native(
             stable = 0;
         }
         last_stat = stat;
-        // 兜底：stat 连续 3 次不变，且批次确实在跑（total>0），视为完成。
-        if stable >= 3 && total.unwrap_or(0) > 0 {
+        // 兜底：stat 连续 3 次不变，批次在跑（total>0），且没有仍在进行的子任务（live==0 或解析不到）。
+        // 绝不能在 live==Some(>0) 时触发，否则进行中 1 会被误判为完成。
+        let no_live = live == Some(0) || live.is_none();
+        if stable >= 3 && total.unwrap_or(0) > 0 && no_live {
             done = true;
             final_state = snap;
-            log("#stat 连续 3 次不变，视为完成".to_string());
+            log("#stat 连续 3 次不变且已无进行中任务，视为完成".to_string());
             break;
         }
     }
