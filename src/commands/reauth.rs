@@ -275,8 +275,10 @@ pub fn build_plan(
 pub struct BannedSweep {
     /// 实际执行过的删除（成功/失败）
     pub outcomes: Vec<DeleteOutcome>,
-    /// 是否因为「疑似封禁数 ≥ 本次总数」的误报闸而**整体跳过**
+    /// 是否因为「疑似封禁数 ≥ 本次总数」而被拦下、**未自动删除**
     pub suppressed: bool,
+    /// 被拦下、等待人工确认的邮箱（前端据此展示「确认删除」）
+    pub pending: Vec<String>,
 }
 
 impl BannedSweep {
@@ -284,83 +286,38 @@ impl BannedSweep {
         Self {
             outcomes: Vec::new(),
             suppressed: false,
+            pending: Vec::new(),
         }
     }
 }
 
-/// 一键流程辅助：把 fetch 检测到的被封禁/停用邮箱从 sub2api 删除。
+/// 邮箱集合归一化：trim + 转小写 + 丢空串 + 排序去重。
+fn normalize_emails(list: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = list
+        .iter()
+        .map(|e| e.trim().to_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// 裸删除执行体：按邮箱精确匹配账号后逐个删除。**内部不做任何闸**，调用方必须先过闸。
 ///
-/// ## 两道防误删闸（血泪事故，删除不可逆，务必保留）
+/// 全仓库只有这里发 `DELETE /api/v1/admin/accounts/:id`，供两条路径复用：
+/// - 自动清理：`delete_banned_accounts`（过闸后调用）
+/// - 人工确认删除：`delete_accounts_by_email`（用户点「确认删除」后直接调用）
 ///
-/// 真实事故：结果页提取逻辑曾把**包住全部结果的祖先容器**当成单条结果
-/// （门页 `#jobs` 的 class 字面量就是 `"jobs"`，含子串 `job`；外层还有 `div.panel`）。
-/// 于是**只要任意一条**失败项的日志里出现封禁词，整页邮箱全被判封禁
-/// → 连**成功**的账号一起从 sub2api 删光。
-///
-/// 闸 0（fail-closed）：`scope` 为空（或全是空串）→ **一个都不删**。
-///                    没给范围不等于不受限，这个函数不能依赖调用方替它保证非空。
-/// 闸 1（`scope`）：只删**本次送进浏览器的邮箱**。结果页可能残留别的 job，
-///                  删到范围外属于越权。
-/// 闸 2（比例）：疑似封禁数 ≥ 本次总数（且本次 ≥2）→ 判为识别误报，整体不删。
-///              真·全批封禁概率极低，而误判全删真实发生过。
-///
-/// 提取侧的对应修复见 `browser::JS_EXTRACT_BANNED`。
-pub fn delete_banned_accounts(
+/// 空列表一律什么都不做。
+pub fn delete_accounts_by_email(
     client: &mut Sub2ApiClient,
     accounts: &[Account],
-    banned: &[String],
-    scope: &[String],
+    emails: &[String],
     log: &Logger,
-) -> BannedSweep {
-    // ── 闸 1：收窄到本次范围 ─────────────────────────────
-    // 注意：**scope 为空必须 fail-closed**。绝不能写成 `allowed.is_empty() || contains(e)`
-    // ——那等于「没给范围就无限制」，会让闸 1 和闸 2 同时失效（闸 2 依赖 allowed.len()），
-    // 正好退回历史事故的形状：整页邮箱一起删。
-    let allowed: std::collections::HashSet<String> = scope
-        .iter()
-        .map(|e| e.trim().to_lowercase())
-        .filter(|e| !e.is_empty())
-        .collect();
-    if allowed.is_empty() {
-        log("本次没有提供邮箱范围（scope 为空），为防误删一律不删除任何账号".to_string());
-        return BannedSweep::skipped();
-    }
-    let mut list: Vec<String> = banned
-        .iter()
-        .map(|e| e.trim().to_lowercase())
-        .filter(|e| !e.is_empty())
-        .filter(|e| allowed.contains(e))
-        .collect();
-    let dropped = banned.len().saturating_sub(list.len());
-    if dropped > 0 {
-        log(format!(
-            "已过滤掉 {} 个不属于本次范围的疑似封禁邮箱（不删）",
-            dropped
-        ));
-    }
-    list.sort();
-    list.dedup();
-
-    if list.is_empty() {
-        return BannedSweep::skipped();
-    }
-
-    // ── 闸 2：全批疑似封禁 → 判为误报 ────────────────────
-    if allowed.len() >= 2 && list.len() >= allowed.len() {
-        log(format!(
-            "⚠️ 疑似封禁 {} 个，达到本次提交总数 {} —— 判为识别误报，已跳过自动删除。\
-             请人工核对后再决定是否手动清理。",
-            list.len(),
-            allowed.len()
-        ));
-        return BannedSweep {
-            outcomes: Vec::new(),
-            suppressed: true,
-        };
-    }
-
+) -> Vec<DeleteOutcome> {
     let mut out = Vec::new();
-    for email in &list {
+    for email in &normalize_emails(emails) {
         let target = match find_account(accounts, email) {
             Some(a) => a,
             None => {
@@ -370,7 +327,7 @@ pub fn delete_banned_accounts(
         };
         match client.delete_account(target.id) {
             Ok(_) => {
-                log(format!("已删除被封禁账号 #{} {}", target.id, email));
+                log(format!("已删除账号 #{} {}", target.id, email));
                 out.push(DeleteOutcome {
                     account_id: target.id,
                     email: email.clone(),
@@ -389,9 +346,81 @@ pub fn delete_banned_accounts(
             }
         }
     }
+    out
+}
+
+/// 一键流程辅助：把 fetch 检测到的被封禁/停用邮箱从 sub2api 删除。
+///
+/// ## 三道防误删闸（血泪事故，删除不可逆，务必保留）
+///
+/// 真实事故：结果页提取逻辑曾把**包住全部结果的祖先容器**当成单条结果
+/// （门页 `#jobs` 的 class 字面量就是 `"jobs"`，含子串 `job`；外层还有 `div.panel`）。
+/// 于是**只要任意一条**失败项的日志里出现封禁词，整页邮箱全被判封禁
+/// → 连**成功**的账号一起从 sub2api 删光。
+///
+/// 闸 0（fail-closed）：`scope` 为空（或全是空串）→ **一个都不删**。
+///                    没给范围不等于不受限，这个函数不能依赖调用方替它保证非空。
+/// 闸 1（`scope`）：只删**本次送进浏览器的邮箱**。结果页可能残留别的 job，
+///                  删到范围外属于越权。
+/// 闸 2（比例）：疑似封禁数 ≥ 本次总数 → **不自动删**，转人工确认（结果落在 `pending`）。
+///              真·全批封禁概率极低，而误判全删真实发生过。**这里刻意不设「本次 ≥2」的
+///              下限**：单账号批次（1/1 命中）同样是 100% 命中，无法与误报区分，
+///              也必须走人工确认，否则闸 2 在最窄的场景下恰好失效。
+///
+/// 提取侧的对应修复见 `browser::JS_EXTRACT_BANNED`。
+pub fn delete_banned_accounts(
+    client: &mut Sub2ApiClient,
+    accounts: &[Account],
+    banned: &[String],
+    scope: &[String],
+    log: &Logger,
+) -> BannedSweep {
+    // ── 闸 0 + 闸 1：scope 必须非空，且只删本次范围 ──────
+    // 注意：**scope 为空必须 fail-closed**。绝不能写成 `allowed.is_empty() || contains(e)`
+    // ——那等于「没给范围就无限制」，会让闸 1 和闸 2 同时失效（闸 2 依赖 allowed.len()），
+    // 正好退回历史事故的形状：整页邮箱一起删。
+    let allowed: std::collections::HashSet<String> = normalize_emails(scope).into_iter().collect();
+    if allowed.is_empty() {
+        log("本次没有提供邮箱范围（scope 为空），为防误删一律不删除任何账号".to_string());
+        return BannedSweep::skipped();
+    }
+    let banned_norm = normalize_emails(banned);
+    let list: Vec<String> = banned_norm
+        .iter()
+        .filter(|e| allowed.contains(*e))
+        .cloned()
+        .collect();
+    let dropped = banned_norm.len().saturating_sub(list.len());
+    if dropped > 0 {
+        log(format!(
+            "已过滤掉 {} 个不属于本次范围的疑似封禁邮箱（不删）",
+            dropped
+        ));
+    }
+
+    if list.is_empty() {
+        return BannedSweep::skipped();
+    }
+
+    // ── 闸 2：全批命中 → 不自动删，转人工确认 ────────────
+    if list.len() >= allowed.len() {
+        log(format!(
+            "⚠️ 疑似封禁 {} 个，已达本次提交总数 {} —— 不再自动删除，请人工核对后确认。",
+            list.len(),
+            allowed.len()
+        ));
+        return BannedSweep {
+            outcomes: Vec::new(),
+            suppressed: true,
+            pending: list,
+        };
+    }
+
+    let outcomes = delete_accounts_by_email(client, accounts, &list, log);
     BannedSweep {
-        outcomes: out,
+        outcomes,
         suppressed: false,
+        pending: Vec::new(),
     }
 }
 
@@ -781,7 +810,7 @@ mod banned_sweep_tests {
         assert!(sweep.outcomes.is_empty(), "范围外的邮箱不得被删除");
     }
 
-    /// 闸 2：疑似封禁数 ≥ 本次总数 → 判识别误报，整体不删（历史全删事故的形状）。
+    /// 闸 2：疑似封禁数 ≥ 本次总数 → 不自动删，转人工确认（历史全删事故的形状）。
     #[test]
     fn full_batch_match_is_suppressed() {
         let accounts = vec![acct(1, "a@x.com"), acct(2, "b@x.com")];
@@ -793,8 +822,66 @@ mod banned_sweep_tests {
             &emails(&["a@x.com", "b@x.com"]),
             &quiet(),
         );
-        assert!(sweep.suppressed, "全批命中应判为误报");
-        assert!(sweep.outcomes.is_empty(), "判为误报时不得删除任何账号");
+        assert!(sweep.suppressed, "全批命中应转人工确认");
+        assert!(sweep.outcomes.is_empty(), "全批命中时不得自动删除任何账号");
+        assert_eq!(sweep.pending, emails(&["a@x.com", "b@x.com"]));
+    }
+
+    /// 单账号批次（1/1 命中）同样只待确认：100% 命中无法与误报区分，
+    /// 闸 2 不能因为「本次只有 1 个」就放行。
+    #[test]
+    fn single_account_batch_is_held_for_confirmation() {
+        let accounts = vec![acct(1, "a@x.com")];
+        let mut client = offline_client();
+        let sweep = delete_banned_accounts(
+            &mut client,
+            &accounts,
+            &emails(&["a@x.com"]),
+            &emails(&["a@x.com"]),
+            &quiet(),
+        );
+        assert!(sweep.suppressed);
+        assert!(sweep.outcomes.is_empty(), "1/1 命中不得自动删除");
+        assert_eq!(sweep.pending, emails(&["a@x.com"]));
+    }
+
+    /// 人工确认删除走裸执行体：不受闸 2 影响，但空列表仍然什么都不做。
+    #[test]
+    fn confirmed_delete_bypasses_ratio_gate_but_not_empty() {
+        let accounts = vec![acct(1, "a@x.com"), acct(2, "b@x.com")];
+        let mut client = offline_client();
+        let out = delete_accounts_by_email(
+            &mut client,
+            &accounts,
+            &emails(&["a@x.com", "b@x.com"]),
+            &quiet(),
+        );
+        assert_eq!(out.len(), 2, "确认后应逐个尝试删除");
+        assert_eq!(out[0].account_id, 1);
+        assert_eq!(out[1].account_id, 2);
+
+        let mut client = offline_client();
+        let out = delete_accounts_by_email(&mut client, &accounts, &[], &quiet());
+        assert!(out.is_empty(), "空列表不得发起删除");
+
+        let mut client = offline_client();
+        let out = delete_accounts_by_email(&mut client, &accounts, &emails(&["  "]), &quiet());
+        assert!(out.is_empty(), "空串列表不得发起删除");
+    }
+
+    /// 人工确认删除遇到不存在的邮箱：跳过、不报错、也不删别人。
+    #[test]
+    fn confirmed_delete_skips_unknown_email() {
+        let accounts = vec![acct(1, "a@x.com")];
+        let mut client = offline_client();
+        let out = delete_accounts_by_email(
+            &mut client,
+            &accounts,
+            &emails(&["nobody@x.com", "a@x.com"]),
+            &quiet(),
+        );
+        assert_eq!(out.len(), 1, "只有真实存在的账号会被尝试删除");
+        assert_eq!(out[0].account_id, 1);
     }
 
     /// 正常路径：只有一部分被判封禁 → 只删那一个，且落在正确的 id 上。
