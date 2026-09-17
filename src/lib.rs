@@ -10,7 +10,6 @@
 //! - [`config`]  config.toml 读写
 //! - [`store`]   本地凭证库（账号 / 密码 / CDK）
 //! - [`browser`] 原生浏览器自动化（chromiumoxide 直连系统 Chrome/Chromium 的 CDP，零 Node）
-//! - [`mail`]    收码站客户端（一键导入邮箱 / 读取验证码，非 CDK 授权路径用）
 //! - [`commands`] CLI 侧的流程编排（账号列表、重授权写回）
 //! - [`totp`]    2FA 验证码
 //! - [`web`]     本地凭证录入页（axum）
@@ -19,7 +18,6 @@ pub mod browser;
 pub mod client;
 pub mod commands;
 pub mod config;
-pub mod mail;
 pub mod models;
 pub mod store;
 pub mod totp;

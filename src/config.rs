@@ -25,38 +25,6 @@ pub struct Config {
     /// 浏览器轮询最长等待秒数（一键重授权用）
     #[serde(default = "default_max_seconds")]
     pub max_seconds: u64,
-
-    // ---- 非 CDK 授权路径（走 sub2api 自带授权链接 + 收码站取验证码）----
-    /// 收码站地址（如 https://mail.kyon888.xyz）
-    #[serde(default)]
-    pub mail_base_url: String,
-    /// 收码站用户名
-    #[serde(default)]
-    pub mail_username: String,
-    /// 收码站密码
-    #[serde(default)]
-    pub mail_password: String,
-    /// 非 CDK 授权是否使用有头窗口（Cloudflare 升级为交互式质询时可人工点一下）
-    #[serde(default)]
-    pub openai_headed: bool,
-    /// 非 CDK 单账号授权最长等待秒数
-    #[serde(default = "default_openai_seconds")]
-    pub openai_max_seconds: u64,
-}
-
-/// 组装收码站配置（供 mail 模块直接用）。
-impl Config {
-    pub fn mail_config(&self) -> crate::mail::MailConfig {
-        crate::mail::MailConfig {
-            base_url: self.mail_base_url.clone(),
-            username: self.mail_username.clone(),
-            password: self.mail_password.clone(),
-        }
-    }
-}
-
-fn default_openai_seconds() -> u64 {
-    240
 }
 
 fn default_verify_tls() -> bool {

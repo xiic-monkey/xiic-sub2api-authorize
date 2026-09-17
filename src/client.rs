@@ -180,32 +180,6 @@ impl Sub2ApiClient {
         Err(anyhow!("请求重试耗尽"))
     }
 
-    /// 让 sub2api 生成一条 OpenAI(ChatGPT/Codex) 授权链接。
-    ///
-    /// 端点：`POST /api/v1/admin/openai/generate-auth-url`，body `{}`。
-    /// 返回 `{auth_url, session_id}`；`auth_url` 是 Codex CLI 式 PKCE 链接，
-    /// 授权完会重定向到 `http://localhost:1455/auth/callback?code=...&state=...`。
-    pub fn generate_openai_auth_url(&mut self) -> Result<serde_json::Value> {
-        self.request(
-            reqwest::Method::POST,
-            "admin/openai/generate-auth-url",
-            Some(&serde_json::json!({})),
-        )
-    }
-
-    /// 用浏览器拿到的 `code` 换回 OAuth 凭证。
-    ///
-    /// 端点：`POST /api/v1/admin/accounts/exchange-code`，
-    /// body `{session_id, code}`（session_id 来自 generate-auth-url）。
-    pub fn exchange_code(&mut self, session_id: &str, code: &str) -> Result<serde_json::Value> {
-        let body = serde_json::json!({ "session_id": session_id, "code": code });
-        self.request(
-            reqwest::Method::POST,
-            "admin/accounts/exchange-code",
-            Some(&body),
-        )
-    }
-
     /// 把 OAuth 凭证写回指定账号（等价于「手动输入 rt 重新授权」）。
     /// 端点：`POST /api/v1/admin/accounts/:id/apply-oauth-credentials`，body `{type, credentials, extra}`。
     /// 服务端会清错误标记 + 失效 token 缓存，且不会新建重复账号。
