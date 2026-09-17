@@ -297,6 +297,8 @@ impl BannedSweep {
 /// 于是**只要任意一条**失败项的日志里出现封禁词，整页邮箱全被判封禁
 /// → 连**成功**的账号一起从 sub2api 删光。
 ///
+/// 闸 0（fail-closed）：`scope` 为空（或全是空串）→ **一个都不删**。
+///                    没给范围不等于不受限，这个函数不能依赖调用方替它保证非空。
 /// 闸 1（`scope`）：只删**本次送进浏览器的邮箱**。结果页可能残留别的 job，
 ///                  删到范围外属于越权。
 /// 闸 2（比例）：疑似封禁数 ≥ 本次总数（且本次 ≥2）→ 判为识别误报，整体不删。
@@ -311,16 +313,23 @@ pub fn delete_banned_accounts(
     log: &Logger,
 ) -> BannedSweep {
     // ── 闸 1：收窄到本次范围 ─────────────────────────────
+    // 注意：**scope 为空必须 fail-closed**。绝不能写成 `allowed.is_empty() || contains(e)`
+    // ——那等于「没给范围就无限制」，会让闸 1 和闸 2 同时失效（闸 2 依赖 allowed.len()），
+    // 正好退回历史事故的形状：整页邮箱一起删。
     let allowed: std::collections::HashSet<String> = scope
         .iter()
         .map(|e| e.trim().to_lowercase())
         .filter(|e| !e.is_empty())
         .collect();
+    if allowed.is_empty() {
+        log("本次没有提供邮箱范围（scope 为空），为防误删一律不删除任何账号".to_string());
+        return BannedSweep::skipped();
+    }
     let mut list: Vec<String> = banned
         .iter()
         .map(|e| e.trim().to_lowercase())
         .filter(|e| !e.is_empty())
-        .filter(|e| allowed.is_empty() || allowed.contains(e))
+        .filter(|e| allowed.contains(e))
         .collect();
     let dropped = banned.len().saturating_sub(list.len());
     if dropped > 0 {
@@ -693,5 +702,132 @@ fn read_clipboard() -> Result<String> {
         Err(anyhow!(
             "当前平台不支持自动读剪切板（仅 macOS pbpaste）。请用 --from 指定结果 JSON 文件。"
         ))
+    }
+}
+
+#[cfg(test)]
+mod banned_sweep_tests {
+    use super::*;
+
+    fn acct(id: i64, email: &str) -> Account {
+        Account {
+            id,
+            name: email.to_string(),
+            platform: "openai".to_string(),
+            account_type: "oauth".to_string(),
+            status: "error".to_string(),
+            error_message: "401 Unauthorized".to_string(),
+            expires_at: None,
+            schedulable: false,
+            priority: None,
+            credentials: None,
+            extra: None,
+        }
+    }
+
+    /// 指向必然拒绝连接的端口：任何真的发起的删除都会以 `ok:false` 落进 `outcomes`，
+    /// 于是「`outcomes` 为空」就等价于「一个删除都没发起」——不用起假服务就能断言。
+    fn offline_client() -> Sub2ApiClient {
+        Sub2ApiClient::new("http://127.0.0.1:9".to_string(), "t".to_string(), None)
+    }
+
+    fn quiet() -> Logger {
+        Arc::new(|_m: String| {})
+    }
+
+    fn emails(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 闸 0：scope 为空绝不能退化成「无限制删除」。
+    #[test]
+    fn empty_scope_deletes_nothing() {
+        let accounts = vec![acct(1, "a@x.com"), acct(2, "b@x.com")];
+        let mut client = offline_client();
+        let sweep = delete_banned_accounts(
+            &mut client,
+            &accounts,
+            &emails(&["a@x.com", "b@x.com"]),
+            &[],
+            &quiet(),
+        );
+        assert!(sweep.outcomes.is_empty(), "空 scope 不得删除任何账号");
+        assert!(!sweep.suppressed);
+
+        // 全是空串 / 纯空白，同样算空 scope
+        let mut client = offline_client();
+        let sweep = delete_banned_accounts(
+            &mut client,
+            &accounts,
+            &emails(&["a@x.com"]),
+            &emails(&["", "   "]),
+            &quiet(),
+        );
+        assert!(sweep.outcomes.is_empty(), "空串 scope 不得删除任何账号");
+    }
+
+    /// 闸 1：范围外的邮箱一律不删（结果页可能残留别的 job）。
+    #[test]
+    fn out_of_scope_is_never_deleted() {
+        let accounts = vec![acct(1, "a@x.com"), acct(9, "other@x.com")];
+        let mut client = offline_client();
+        let sweep = delete_banned_accounts(
+            &mut client,
+            &accounts,
+            &emails(&["other@x.com"]),
+            &emails(&["a@x.com", "b@x.com"]),
+            &quiet(),
+        );
+        assert!(sweep.outcomes.is_empty(), "范围外的邮箱不得被删除");
+    }
+
+    /// 闸 2：疑似封禁数 ≥ 本次总数 → 判识别误报，整体不删（历史全删事故的形状）。
+    #[test]
+    fn full_batch_match_is_suppressed() {
+        let accounts = vec![acct(1, "a@x.com"), acct(2, "b@x.com")];
+        let mut client = offline_client();
+        let sweep = delete_banned_accounts(
+            &mut client,
+            &accounts,
+            &emails(&["a@x.com", "b@x.com"]),
+            &emails(&["a@x.com", "b@x.com"]),
+            &quiet(),
+        );
+        assert!(sweep.suppressed, "全批命中应判为误报");
+        assert!(sweep.outcomes.is_empty(), "判为误报时不得删除任何账号");
+    }
+
+    /// 正常路径：只有一部分被判封禁 → 只删那一个，且落在正确的 id 上。
+    #[test]
+    fn partial_match_deletes_only_flagged_account() {
+        let accounts = vec![acct(1, "a@x.com"), acct(2, "b@x.com"), acct(3, "c@x.com")];
+        let mut client = offline_client();
+        let sweep = delete_banned_accounts(
+            &mut client,
+            &accounts,
+            &emails(&["c@x.com"]),
+            &emails(&["a@x.com", "b@x.com", "c@x.com"]),
+            &quiet(),
+        );
+        assert!(!sweep.suppressed);
+        assert_eq!(sweep.outcomes.len(), 1, "只应对被判封禁的那一个发起删除");
+        assert_eq!(sweep.outcomes[0].account_id, 3);
+        assert_eq!(sweep.outcomes[0].email, "c@x.com");
+    }
+
+    /// 邮箱匹配忽略大小写（scope 与被封禁列表两侧都要）。
+    #[test]
+    fn scope_and_banned_matching_ignores_case() {
+        let accounts = vec![acct(1, "a@x.com")];
+        let mut client = offline_client();
+        let sweep = delete_banned_accounts(
+            &mut client,
+            &accounts,
+            &emails(&["A@X.COM"]),
+            &emails(&["a@x.com", "b@x.com"]),
+            &quiet(),
+        );
+        assert_eq!(sweep.outcomes.len(), 1);
+        assert_eq!(sweep.outcomes[0].account_id, 1);
     }
 }
