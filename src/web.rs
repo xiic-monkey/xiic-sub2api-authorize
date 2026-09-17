@@ -19,8 +19,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 const PORT: u16 = 7878;
 
@@ -171,7 +171,9 @@ async fn api_reauth(State(st): State<AppState>, Form(f): Form<ReauthForm>) -> Js
                     cpa_url: &cfg.cpa_url,
                     max_ms: cfg.max_seconds.saturating_mul(1000),
                     engine: engine.as_deref(),
-                    cdk: store::load()?.map(|x| x.cdk).filter(|s| !s.trim().is_empty()),
+                    cdk: store::load()?
+                        .map(|x| x.cdk)
+                        .filter(|s| !s.trim().is_empty()),
                     yes,
                     only_email: only_email.as_deref(),
                 },
@@ -217,7 +219,11 @@ fn summarize(r: &reauth::OnceResult, yes: bool) -> String {
                 "  #{} {} {}\n",
                 o.account_id,
                 o.email,
-                if o.ok { "成功".to_string() } else { o.message.clone() }
+                if o.ok {
+                    "成功".to_string()
+                } else {
+                    o.message.clone()
+                }
             ));
         }
     } else {

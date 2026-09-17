@@ -62,7 +62,11 @@ impl Account {
     pub fn expires_in_days(&self) -> Option<i64> {
         let raw = self.expires_at?;
         // 秒（~1.7e9）与毫秒（~1.7e12）区分：大于 1e12 视为毫秒
-        let ms = if raw > 1_000_000_000_000 { raw } else { raw * 1000 };
+        let ms = if raw > 1_000_000_000_000 {
+            raw
+        } else {
+            raw * 1000
+        };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)

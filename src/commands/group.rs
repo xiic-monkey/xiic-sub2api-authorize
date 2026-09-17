@@ -75,7 +75,12 @@ pub fn group_accounts(client: &mut Sub2ApiClient, page_size: usize) -> Result<Gr
                     account_ids: chunk.to_vec(),
                     ok,
                     message: if ok {
-                        format!("第 {} 页（{} 个账号）优先级已设为 {}", page, chunk.len(), page)
+                        format!(
+                            "第 {} 页（{} 个账号）优先级已设为 {}",
+                            page,
+                            chunk.len(),
+                            page
+                        )
                     } else {
                         format!(
                             "第 {} 页有 {} 个账号设置失败：{}",

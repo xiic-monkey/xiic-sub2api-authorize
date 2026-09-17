@@ -21,11 +21,7 @@ pub fn detect(client: &mut Sub2ApiClient) -> anyhow::Result<()> {
     for a in &needs {
         println!(
             "  #{:<5} name={:<32} platform={:<12} status={:<9} error={}",
-            a.id,
-            a.name,
-            a.platform,
-            a.status,
-            a.error_message
+            a.id, a.name, a.platform, a.status, a.error_message
         );
     }
     Ok(())
@@ -246,10 +242,7 @@ pub fn build_plan(
             }
         };
 
-        let merged = merge_credentials(
-            &creds,
-            target.credentials.as_ref().unwrap_or(&Value::Null),
-        );
+        let merged = merge_credentials(&creds, target.credentials.as_ref().unwrap_or(&Value::Null));
         let extra = target
             .extra
             .clone()
@@ -370,7 +363,11 @@ pub fn apply_value(
         let tail = if report.skipped.is_empty() {
             String::new()
         } else {
-            format!("（跳过 {} 项：{}）", report.skipped.len(), report.skipped.join("；"))
+            format!(
+                "（跳过 {} 项：{}）",
+                report.skipped.len(),
+                report.skipped.join("；")
+            )
         };
         return Err(anyhow!("没有匹配到任何可写回的账号。{}", tail));
     }
@@ -547,7 +544,10 @@ pub fn run_once(client: &mut Sub2ApiClient, opts: OnceOpts, log: &Logger) -> Res
     if raw.is_empty() {
         bail!("浏览器流程没有拿到结果（CPA 输出与剪切板都为空）");
     }
-    log(format!("拿到结果（{} 字符），开始按邮箱匹配写回", raw.len()));
+    log(format!(
+        "拿到结果（{} 字符），开始按邮箱匹配写回",
+        raw.len()
+    ));
 
     // 先处理被封禁/停用的账号：从 sub2api 直接删除，避免继续写回或调度
     let banned_emails: Vec<String> = out

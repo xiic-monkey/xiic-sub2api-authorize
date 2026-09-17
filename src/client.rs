@@ -45,7 +45,10 @@ impl Sub2ApiClient {
             .build()
             .context("构建 HTTP client 失败")?;
 
-        let url = format!("{}/api/v1/auth/login", config.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/api/v1/auth/login",
+            config.base_url.trim_end_matches('/')
+        );
         let body = serde_json::json!({ "email": config.email, "password": config.password });
         let resp = http.post(&url).json(&body).send().context("登录请求失败")?;
         let status = resp.status();
@@ -66,9 +69,16 @@ impl Sub2ApiClient {
                 .as_ref()
                 .context("后台已开启 2FA，但 config.toml 未填 totp_secret")?;
             let code = crate::totp::generate_current(secret)?;
-            let url2 = format!("{}/api/v1/auth/login/2fa", config.base_url.trim_end_matches('/'));
+            let url2 = format!(
+                "{}/api/v1/auth/login/2fa",
+                config.base_url.trim_end_matches('/')
+            );
             let body2 = serde_json::json!({ "temp_token": temp, "totp_code": code });
-            let resp2 = http.post(&url2).json(&body2).send().context("2FA 请求失败")?;
+            let resp2 = http
+                .post(&url2)
+                .json(&body2)
+                .send()
+                .context("2FA 请求失败")?;
             let val2: serde_json::Value = resp2.json().context("解析 2FA 响应失败")?;
             let d2 = extract_data(val2);
             let at = d2
@@ -76,7 +86,10 @@ impl Sub2ApiClient {
                 .and_then(|v| v.as_str())
                 .context("2FA 后未返回 access_token")?
                 .to_string();
-            let rt = d2.get("refresh_token").and_then(|v| v.as_str()).map(str::to_string);
+            let rt = d2
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             return Ok(Self::new(config.base_url.clone(), at, rt));
         }
 
@@ -85,7 +98,10 @@ impl Sub2ApiClient {
             .and_then(|v| v.as_str())
             .context("登录未返回 access_token")?
             .to_string();
-        let rt = data.get("refresh_token").and_then(|v| v.as_str()).map(str::to_string);
+        let rt = data
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         Ok(Self::new(config.base_url.clone(), at, rt))
     }
 
@@ -104,7 +120,10 @@ impl Sub2ApiClient {
 
     /// 用 refresh_token 换新 token 对。
     fn refresh(&mut self) -> Result<()> {
-        let rt = self.refresh_token.clone().context("无 refresh_token 可刷新")?;
+        let rt = self
+            .refresh_token
+            .clone()
+            .context("无 refresh_token 可刷新")?;
         let body = serde_json::json!({ "refresh_token": rt });
         let resp = self
             .http
@@ -136,7 +155,10 @@ impl Sub2ApiClient {
             let mut rb = self
                 .http
                 .request(method.clone(), self.url(path))
-                .header(header::AUTHORIZATION, format!("Bearer {}", self.access_token))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", self.access_token),
+                )
                 .header(header::CONTENT_TYPE, "application/json");
             if let Some(b) = body {
                 rb = rb.json(b);
@@ -158,6 +180,32 @@ impl Sub2ApiClient {
         Err(anyhow!("请求重试耗尽"))
     }
 
+    /// 让 sub2api 生成一条 OpenAI(ChatGPT/Codex) 授权链接。
+    ///
+    /// 端点：`POST /api/v1/admin/openai/generate-auth-url`，body `{}`。
+    /// 返回 `{auth_url, session_id}`；`auth_url` 是 Codex CLI 式 PKCE 链接，
+    /// 授权完会重定向到 `http://localhost:1455/auth/callback?code=...&state=...`。
+    pub fn generate_openai_auth_url(&mut self) -> Result<serde_json::Value> {
+        self.request(
+            reqwest::Method::POST,
+            "admin/openai/generate-auth-url",
+            Some(&serde_json::json!({})),
+        )
+    }
+
+    /// 用浏览器拿到的 `code` 换回 OAuth 凭证。
+    ///
+    /// 端点：`POST /api/v1/admin/accounts/exchange-code`，
+    /// body `{session_id, code}`（session_id 来自 generate-auth-url）。
+    pub fn exchange_code(&mut self, session_id: &str, code: &str) -> Result<serde_json::Value> {
+        let body = serde_json::json!({ "session_id": session_id, "code": code });
+        self.request(
+            reqwest::Method::POST,
+            "admin/accounts/exchange-code",
+            Some(&body),
+        )
+    }
+
     /// 把 OAuth 凭证写回指定账号（等价于「手动输入 rt 重新授权」）。
     /// 端点：`POST /api/v1/admin/accounts/:id/apply-oauth-credentials`，body `{type, credentials, extra}`。
     /// 服务端会清错误标记 + 失效 token 缓存，且不会新建重复账号。
@@ -173,7 +221,11 @@ impl Sub2ApiClient {
     /// 设置账号是否可调度（= 管理页的「调度」开关）。
     /// 端点：`POST /api/v1/admin/accounts/:id/schedulable`，body `{"schedulable": bool}`。
     /// 上游 401 时 `SetError` 会顺手把 schedulable 置 false，重授权写回后需要把它打开。
-    pub fn set_schedulable(&mut self, account_id: i64, schedulable: bool) -> Result<serde_json::Value> {
+    pub fn set_schedulable(
+        &mut self,
+        account_id: i64,
+        schedulable: bool,
+    ) -> Result<serde_json::Value> {
         let path = format!("admin/accounts/{}/schedulable", account_id);
         let body = serde_json::json!({ "schedulable": schedulable });
         self.request(reqwest::Method::POST, &path, Some(&body))
@@ -198,17 +250,29 @@ impl Sub2ApiClient {
             "account_ids": account_ids,
             "priority": field,
         });
-        self.request(reqwest::Method::POST, "admin/accounts/bulk-update", Some(&body))
+        self.request(
+            reqwest::Method::POST,
+            "admin/accounts/bulk-update",
+            Some(&body),
+        )
     }
 
     /// 把一批账号的优先级统一设为 `priority`（sub2api 里数字越小越优先）。
-    pub fn set_priority_bulk(&mut self, account_ids: &[i64], priority: i64) -> Result<serde_json::Value> {
+    pub fn set_priority_bulk(
+        &mut self,
+        account_ids: &[i64],
+        priority: i64,
+    ) -> Result<serde_json::Value> {
         self.bulk_update(account_ids, &serde_json::json!(priority))
     }
 
     /// 单个账号设优先级（批量端点不可用时的兜底）。
     /// 端点：`PUT /api/v1/admin/accounts/:id`，body `{"priority": n}`。
-    pub fn set_priority_one(&mut self, account_id: i64, priority: i64) -> Result<serde_json::Value> {
+    pub fn set_priority_one(
+        &mut self,
+        account_id: i64,
+        priority: i64,
+    ) -> Result<serde_json::Value> {
         let path = format!("admin/accounts/{}", account_id);
         let body = serde_json::json!({ "priority": priority });
         self.request(reqwest::Method::PUT, &path, Some(&body))

@@ -3,7 +3,10 @@ use clap::{Parser, Subcommand};
 use sub2api_operator::{browser, client, commands, config, store, web};
 
 #[derive(Parser)]
-#[command(name = "sub2op", about = "sub2api 外部运维工具（不修改上游，纯 admin API 驱动）")]
+#[command(
+    name = "sub2op",
+    about = "sub2api 外部运维工具（不修改上游，纯 admin API 驱动）"
+)]
 struct Cli {
     /// 配置文件路径
     #[arg(long, default_value = "config.toml")]
@@ -186,7 +189,9 @@ fn main() -> anyhow::Result<()> {
                     None => store::load()?.map(|c| c.cdk).filter(|s| !s.is_empty()),
                 };
                 if cdk.is_none() {
-                    println!("⚠️ 未提供 CDK 且 credentials.db 为空：仅做门页状态检测，不填表/不点击");
+                    println!(
+                        "⚠️ 未提供 CDK 且 credentials.db 为空：仅做门页状态检测，不填表/不点击"
+                    );
                 }
                 browser::gate(&url, cdk.as_deref(), std::path::Path::new(&out_dir), engine)?;
                 println!("✅ 门页流程完成。截图与 HTML 在：{}", out_dir);
