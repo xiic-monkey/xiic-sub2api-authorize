@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>jobs repro</title>
+</head>
+<body>
+<!--
+  回归夹具：还原 401 门页（401.kyon888.xyz）结果区的真实 DOM 结构。
+  结构取自线上 HTML 模板，不是凭空捏的：
+
+    <div id="jobs" class="jobs"></div>
+    jobs.map(job => `<div class="card">
+        <div class="top">
+          <span class="mail">${job.email}</span>
+          <span class="st ${job.status}">${statusText[job.status] || job.status}</span>
+        </div>
+        <div class="log">…</div>
+      </div>`)
+
+  其中 statusText = {queued:"排队", running:"进行中", ok:"成功", error:"失败"}
+
+  陷阱所在：#jobs 的 class 字面量就是 "jobs"，含子串 "job"。
+  旧版选择器里的 [class*="job"] 因此命中了**包住全部结果的祖先容器**，
+  加上 #work > *（同样包住 #jobs 的 div.panel），于是只要**任意一条**失败项
+  的日志里出现封禁词，整页邮箱全被判为封禁 → sub2api 里全删（含成功账号）。
+
+  期望：只有 bad5@example.com 被判封禁。
+    ok1 / ok2  成功           → 不该判
+    err4       失败(超时)      → 有失败但无封禁词，不该判
+    bad5       失败(已停用)    → 应判
+-->
+<div id="work">
+  <p class="sub">一行一个邮箱。需填写 CDK。</p>
+  <div class="panel">
+    <div class="bar">
+      <textarea id="emails"></textarea>
+      <div class="meta">
+        <span id="stat">共 4 个 · 成功 2 · 失败 2 · 进行中 0</span>
+        <span id="left"></span>
+      </div>
+      <button id="go">获取令牌</button>
+      <button class="ghost">复制失败邮箱</button>
+    </div>
+    <div id="err" class="err"></div>
+    <div id="jobs" class="jobs">
+      <div class="card">
+        <div class="top">
+          <span class="mail">ok1@example.com</span>
+          <span class="st ok">成功</span>
+        </div>
+        <div class="log">token issued</div>
+      </div>
+      <div class="card">
+        <div class="top">
+          <span class="mail">ok2@example.com</span>
+          <span class="st ok">成功</span>
+        </div>
+        <div class="log">token issued</div>
+      </div>
+      <div class="card">
+        <div class="top">
+          <span class="mail">err4@example.com</span>
+          <span class="st error">失败</span>
+        </div>
+        <div class="log">request timeout after 60s</div>
+      </div>
+      <div class="card">
+        <div class="top">
+          <span class="mail">bad5@example.com</span>
+          <span class="st error">失败</span>
+        </div>
+        <div class="log">Account deactivated by OpenAI</div>
+      </div>
+    </div>
+  </div>
+  <div class="panel">
+    <p class="merge-title">合并 CDK</p>
+  </div>
+</div>
+</body>
+</html>

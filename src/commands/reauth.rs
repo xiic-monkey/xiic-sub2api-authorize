@@ -270,15 +270,88 @@ pub fn build_plan(
     })
 }
 
+/// 「删除被封禁账号」的执行结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct BannedSweep {
+    /// 实际执行过的删除（成功/失败）
+    pub outcomes: Vec<DeleteOutcome>,
+    /// 是否因为「疑似封禁数 ≥ 本次总数」的误报闸而**整体跳过**
+    pub suppressed: bool,
+}
+
+impl BannedSweep {
+    pub fn skipped() -> Self {
+        Self {
+            outcomes: Vec::new(),
+            suppressed: false,
+        }
+    }
+}
+
 /// 一键流程辅助：把 fetch 检测到的被封禁/停用邮箱从 sub2api 删除。
+///
+/// ## 两道防误删闸（血泪事故，删除不可逆，务必保留）
+///
+/// 真实事故：结果页提取逻辑曾把**包住全部结果的祖先容器**当成单条结果
+/// （门页 `#jobs` 的 class 字面量就是 `"jobs"`，含子串 `job`；外层还有 `div.panel`）。
+/// 于是**只要任意一条**失败项的日志里出现封禁词，整页邮箱全被判封禁
+/// → 连**成功**的账号一起从 sub2api 删光。
+///
+/// 闸 1（`scope`）：只删**本次送进浏览器的邮箱**。结果页可能残留别的 job，
+///                  删到范围外属于越权。
+/// 闸 2（比例）：疑似封禁数 ≥ 本次总数（且本次 ≥2）→ 判为识别误报，整体不删。
+///              真·全批封禁概率极低，而误判全删真实发生过。
+///
+/// 提取侧的对应修复见 `browser::JS_EXTRACT_BANNED`。
 pub fn delete_banned_accounts(
     client: &mut Sub2ApiClient,
     accounts: &[Account],
     banned: &[String],
+    scope: &[String],
     log: &Logger,
-) -> Vec<DeleteOutcome> {
+) -> BannedSweep {
+    // ── 闸 1：收窄到本次范围 ─────────────────────────────
+    let allowed: std::collections::HashSet<String> = scope
+        .iter()
+        .map(|e| e.trim().to_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+    let mut list: Vec<String> = banned
+        .iter()
+        .map(|e| e.trim().to_lowercase())
+        .filter(|e| !e.is_empty())
+        .filter(|e| allowed.is_empty() || allowed.contains(e))
+        .collect();
+    let dropped = banned.len().saturating_sub(list.len());
+    if dropped > 0 {
+        log(format!(
+            "已过滤掉 {} 个不属于本次范围的疑似封禁邮箱（不删）",
+            dropped
+        ));
+    }
+    list.sort();
+    list.dedup();
+
+    if list.is_empty() {
+        return BannedSweep::skipped();
+    }
+
+    // ── 闸 2：全批疑似封禁 → 判为误报 ────────────────────
+    if allowed.len() >= 2 && list.len() >= allowed.len() {
+        log(format!(
+            "⚠️ 疑似封禁 {} 个，达到本次提交总数 {} —— 判为识别误报，已跳过自动删除。\
+             请人工核对后再决定是否手动清理。",
+            list.len(),
+            allowed.len()
+        ));
+        return BannedSweep {
+            outcomes: Vec::new(),
+            suppressed: true,
+        };
+    }
+
     let mut out = Vec::new();
-    for email in banned {
+    for email in &list {
         let target = match find_account(accounts, email) {
             Some(a) => a,
             None => {
@@ -307,7 +380,10 @@ pub fn delete_banned_accounts(
             }
         }
     }
-    out
+    BannedSweep {
+        outcomes: out,
+        suppressed: false,
+    }
 }
 
 /// 核心：执行写回（逐项 POST `apply-oauth-credentials`，成功后恢复调度开关）。
@@ -549,7 +625,8 @@ pub fn run_once(client: &mut Sub2ApiClient, opts: OnceOpts, log: &Logger) -> Res
         raw.len()
     ));
 
-    // 先处理被封禁/停用的账号：从 sub2api 直接删除，避免继续写回或调度
+    // 先处理被封禁/停用的账号：从 sub2api 直接删除，避免继续写回或调度。
+    // 防误删的两道闸在 `delete_banned_accounts` 内部（提取侧的修复见 JS_EXTRACT_BANNED）。
     let banned_emails: Vec<String> = out
         .get("bannedEmails")
         .and_then(|v| v.as_array())
@@ -560,8 +637,9 @@ pub fn run_once(client: &mut Sub2ApiClient, opts: OnceOpts, log: &Logger) -> Res
                 .collect()
         })
         .unwrap_or_default();
+
     let deleted = if !banned_emails.is_empty() {
-        delete_banned_accounts(client, &accounts, &banned_emails, log)
+        delete_banned_accounts(client, &accounts, &banned_emails, &emails, log).outcomes
     } else {
         Vec::new()
     };

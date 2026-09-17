@@ -508,30 +508,73 @@ const JS_FIELDS: &str = "(() => { const els = [...document.querySelectorAll('inp
                          .slice(0, 80); })()";
 
 /// 从 401 结果页提取「账号已被封禁/停用」的邮箱列表。
-/// 先按结果项容器扫描，再兜底扫描全页文本。
-const JS_EXTRACT_BANNED: &str = r#"(() => {
+///
+/// ## 为什么写得这么啰嗦（血泪史）
+///
+/// 旧版用宽泛选择器（`#work > *`、`[class*="job"]` …）扫容器，
+/// **只要容器文本里有封禁词，就把容器内所有邮箱判为封禁**。
+/// 真实门页的结构是：
+///
+/// ```html
+/// <div id="work">
+///   <div class="panel">          <!-- #work > * -->
+///     <div id="jobs" class="jobs"> <!-- 也命中 [class*="job"]！ -->
+///       <div class="card">… ok1@x.com</div>
+///       <div class="card">… ok2@x.com</div>
+///       <div class="card">… bad3@x.com  ← 只有这条的 log 含 "deactivated"</div>
+/// ```
+///
+/// `#jobs` 的 `class="jobs"` 含子串 `job`，于是 `[class*="job"]` 命中了
+/// **包住全部结果的祖先容器**，`div.panel` 同理。结果：只要**任意一条**失败项
+/// 带封禁词，整页邮箱全被判封禁 → sub2api 里**全删**（含成功账号）。
+///
+/// 现在只认「单条结果卡片」，且强制「该容器恰好只含一个邮箱」：
+/// 一旦发现容器里邮箱数 > 1，说明它是聚合容器，直接丢弃。
+/// 宁可漏判（账号留着，下次再说），绝不误判（删号不可逆）。
+///
+/// 验证脚本：`cargo run --example ban_extract_probe -- tests/fixtures/jobs_page_repro.html`
+pub const JS_EXTRACT_BANNED: &str = r#"(() => {
   const keywords = ['封禁','停用','deactivated','banned','suspended','disabled'];
   const emailRe = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+  const hasBanWord = (s) => !!s && keywords.some(k => s.toLowerCase().includes(k.toLowerCase()));
   const banned = new Set();
-  const hasBanWord = (s) => s && keywords.some(k => s.toLowerCase().includes(k.toLowerCase()));
-  const containers = document.querySelectorAll('#jobs > *, #work > *, #stat > *, [class*="result"], [class*="item"], [class*="card"], [class*="row"], [class*="job"]');
-  for (const el of containers) {
-    const text = (el.innerText || '').toLowerCase();
-    if (hasBanWord(text)) {
-      const emails = ((el.innerText || '').match(emailRe) || []);
-      for (const email of emails) banned.add(email.toLowerCase());
+
+  // 只取「单条结果」容器：#jobs 的直接子元素，或结果区里的卡片。
+  // 注意 [class~="card"] 是整词匹配，不会像 [class*="card"] 那样误伤 cardlist。
+  const boxes = document.querySelectorAll('#jobs > *, #work .card, .jobs > *, [class~="card"]');
+
+  for (const el of boxes) {
+    const text = el.innerText || '';
+    const own = text.match(emailRe) || [];
+
+    // 该条状态：门页的 <span class="st ok|error|queued|running">。
+    // 已成功的条目绝不可能「被封禁」——直接跳过，避免日志里出现 disabled 之类
+    // 无关字样（例如「2FA disabled」）被算成封禁。
+    const stEl = el.querySelector ? el.querySelector('.st') : null;
+    if (stEl) {
+      const stCls = (stEl.className || '').toLowerCase();
+      const stTxt = (stEl.textContent || '').trim().toLowerCase();
+      if (/\bok\b/.test(stCls) || stTxt === 'ok' || stTxt === '成功') continue;
     }
-  }
-  if (banned.size === 0 && document.body) {
-    const bodyText = document.body.innerText || '';
-    const emails = [...bodyText.matchAll(emailRe)].map(m => m[0]);
-    for (const email of emails) {
-      const idx = bodyText.indexOf(email);
-      if (idx < 0) continue;
-      const surrounding = bodyText.substring(Math.max(0, idx - 200), Math.min(bodyText.length, idx + 300));
-      if (hasBanWord(surrounding)) banned.add(email.toLowerCase());
+
+    // 结构性取邮箱：卡片里的 .mail 就是这一条的邮箱
+    const mailEl = el.querySelector ? el.querySelector('.mail') : null;
+    const mail = (mailEl && (mailEl.textContent || '').trim()) || '';
+
+    // 拿不到结构化邮箱时，才退化成「容器里恰好一个邮箱」的推断；
+    // 一旦 >1 就说明这是聚合容器，必须丢弃。
+    let email = mail;
+    if (!email) {
+      if (own.length !== 1) continue;
+      email = own[0];
     }
+
+    // 双保险：即使拿到了 .mail，若卡片内还混着别的邮箱，也不认（结构异常）
+    if (own.length > 1) continue;
+
+    if (hasBanWord(text)) banned.add(email.toLowerCase());
   }
+
   return [...banned];
 })()"#;
 
