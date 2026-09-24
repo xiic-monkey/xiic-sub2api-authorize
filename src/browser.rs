@@ -943,6 +943,64 @@ pub fn fetch(
     Ok(())
 }
 
+/// 把任意文本（如用户粘贴的账号 JSON）喂给 CPA 转换页，返回其 `#output` 转换结果。
+///
+/// 复用重授权流程里同款 CPA 页交互（打开 cpa_url → 点 sub2api 渠道 → 填 `#session-input` → 读 `#output`），
+/// 与 `fetch_stream` 不同：这里不依赖门页 / 剪切板，`input` 直接来自参数。转换结果即「sub2api 可导入格式」。
+pub async fn cpa_convert_text(
+    cpa_url: &str,
+    engine: Option<&str>,
+    input: &str,
+    hooks: &FetchHooks,
+) -> Result<String> {
+    if input.trim().is_empty() {
+        anyhow::bail!("转换输入为空");
+    }
+    (hooks.step)("cpa", "打开 CPA 转换页".to_string());
+    let (browser, profile_dir) = launch(engine).await?;
+    let res: Result<String> = async {
+        let page = browser.new_page("about:blank").await?;
+        grant_clipboard(&page).await;
+        let mut errors: Vec<String> = Vec::new();
+        goto(&page, cpa_url, &mut errors).await;
+        sleep(Duration::from_millis(2500)).await;
+        if !js_click_sub2api_channel(&page).await {
+            errors.push("cpa-channel: 未找到 sub2api 渠道按钮".to_string());
+        }
+        if !js_fill(&page, "#session-input", input).await {
+            anyhow::bail!("cpa-fill: 填入 #session-input 失败");
+        }
+        (hooks.step)("cpa", "已填入，等待转换输出…".to_string());
+        let mut out = String::new();
+        // 轮询 #output，最多 ~25s；输出非空即视为转换完成（不强制含 refresh_token，
+        // 因为导入格式可能与重授权凭证形态不同）。
+        for _ in 0..17 {
+            sleep(Duration::from_millis(1500)).await;
+            let cur = js_input_value(&page, "#output").await;
+            if !cur.trim().is_empty() {
+                // 再等半秒兜底，避免只抓到半截流式输出
+                sleep(Duration::from_millis(500)).await;
+                let more = js_input_value(&page, "#output").await;
+                out = if more.trim().is_empty() { cur } else { more };
+                break;
+            }
+        }
+        let _ = js_click(&page, "#copy-output").await;
+        if out.trim().is_empty() {
+            if errors.is_empty() {
+                anyhow::bail!("CPA 页未产出输出（#output 为空），请检查输入格式或页面是否需要手动点「转换」");
+            } else {
+                anyhow::bail!("CPA 转换失败：{}", errors.join("；"));
+            }
+        }
+        let _ = page.close().await;
+        Ok(out)
+    }
+    .await;
+    cleanup_browser(browser, &profile_dir);
+    res
+}
+
 /// 流式版 `fetch`：只有日志回调（web 控制台用）。
 pub fn fetch_stream(
     url: &str,

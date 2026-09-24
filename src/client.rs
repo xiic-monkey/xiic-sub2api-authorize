@@ -23,6 +23,40 @@ fn extract_data(v: serde_json::Value) -> serde_json::Value {
     v
 }
 
+/// 分组最小信息（仅导入流程用到 id + name）。
+#[derive(Debug, Clone)]
+pub struct GroupMin {
+    pub id: i64,
+    pub name: String,
+}
+
+/// 从可能是信封/数组混合的 JSON 中抽取列表数组。
+/// 兼容：`data.items`、`data`、`items`、`groups`、`accounts`、或本身就是数组。
+fn extract_array(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    if let serde_json::Value::Array(a) = v {
+        return a.clone();
+    }
+    if let Some(obj) = v.as_object() {
+        for key in ["items", "data", "accounts", "groups"] {
+            if let Some(x) = obj.get(key) {
+                if let serde_json::Value::Array(a) = x {
+                    return a.clone();
+                }
+            }
+        }
+        if let Some(data) = obj.get("data") {
+            if let Some(obj2) = data.as_object() {
+                if let Some(x) = obj2.get("items") {
+                    if let serde_json::Value::Array(a) = x {
+                        return a.clone();
+                    }
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
 impl Sub2ApiClient {
     pub fn new(base_url: String, access_token: String, refresh_token: Option<String>) -> Self {
         let http = HttpClient::builder()
@@ -285,5 +319,41 @@ impl Sub2ApiClient {
             }
         }
         Ok(all)
+    }
+
+    /// 列出全部分组（sub2api 原生 groups 实体，区别于 priority 分级）。
+    /// 端点：`GET /api/v1/admin/groups/all`（老版本无 `/all` 时退回 `/groups?page_size=1000`）。
+    /// 返回 `{id, name}` 列表，供导入时把账号关联到分组。
+    pub fn list_groups(&mut self) -> Result<Vec<GroupMin>> {
+        let val = match self.request(reqwest::Method::GET, "admin/groups/all", None) {
+            Ok(v) => v,
+            Err(_) => self
+                .request(reqwest::Method::GET, "admin/groups?page_size=1000", None)?,
+        };
+        let arr = extract_array(&val);
+        let mut out = Vec::new();
+        for it in arr {
+            let id = it.get("id").and_then(|x| x.as_i64());
+            let name = it
+                .get("name")
+                .and_then(|x| x.as_str())
+                .or_else(|| it.get("group_name").and_then(|x| x.as_str()))
+                .map(str::to_string);
+            if let (Some(id), Some(name)) = (id, name) {
+                out.push(GroupMin { id, name });
+            }
+        }
+        Ok(out)
+    }
+
+    /// 批量创建账号。
+    /// 端点：`POST /api/v1/admin/accounts/batch`，body `{"accounts":[CreateAccountRequest...]}`。
+    /// 服务端返回 `{success, failed, results:[{name, id, success}]}`。
+    /// 调用方负责在 body 里填好每个账号的 `group_ids`（可多选，写进数组）。
+    pub fn batch_create_accounts(
+        &mut self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.request(reqwest::Method::POST, "admin/accounts/batch", Some(body))
     }
 }
